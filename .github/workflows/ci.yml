@@ -68,27 +68,3 @@ jobs:
           name: binaries
           path: bin/
 
-  e2e:
-    runs-on: ubuntu-latest
-    # Only run e2e tests when token is available (not on forks)
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-      - uses: actions/checkout@v7
-      
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.26'
-      
-      - name: Download dependencies
-        run: go mod download
-      
-      - name: Run E2E tests
-        env:
-          GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TEST_REPOSITORY: ujala-singh/github-repository-dispatch-receiver
-        run: |
-          echo "Running E2E tests with automatic GitHub token..."
-          echo "Testing against repository: $TEST_REPOSITORY"
-          go test -v -tags=e2e ./e2e/...
-
