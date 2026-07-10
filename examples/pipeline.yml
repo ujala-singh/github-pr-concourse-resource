@@ -1,0 +1,270 @@
+# Example Concourse Pipeline
+
+# This file demonstrates various usage patterns for the GitHub PR resource
+
+resource_types:
+  - name: github-pr
+    type: registry-image
+    source:
+      repository: yourusername/github-pr-concourse-resource
+      tag: latest
+
+resources:
+  # PR List Mode - for instance pipelines
+  - name: open-prs
+    type: github-pr
+    check_every: 1m
+    webhook_token: ((webhook-token))
+    source:
+      repository: myorg/myrepo
+      access_token: ((github-token))
+      base_branch: main
+      ignore_drafts: true
+      required_review_approvals: 1
+      states: ["OPEN"]
+
+  # Single PR Mode - tracks commits to PR #42
+  - name: specific-pr
+    type: github-pr
+    source:
+      repository: myorg/myrepo
+      access_token: ((github-token))
+      number: 42
+
+  # PR List with path filtering
+  - name: backend-prs
+    type: github-pr
+    source:
+      repository: myorg/myrepo
+      access_token: ((github-token))
+      paths:
+        - "backend/**"
+        - "api/**"
+      ignore_paths:
+        - "**/*.md"
+        - "docs/**"
+
+jobs:
+  # Job 1: Test each open PR (PR List Mode)
+  - name: test-prs
+    public: true
+    plan:
+      - get: open-prs
+        trigger: true
+        version: every
+      
+      - task: run-tests
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: golang
+              tag: "1.22"
+          
+          inputs:
+            - name: open-prs
+          
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                PR_NUMBER=$(cat open-prs/.git/resource/pr)
+                PR_TITLE=$(cat open-prs/.git/resource/title)
+                PR_AUTHOR=$(cat open-prs/.git/resource/author)
+                
+                echo "Testing PR #$PR_NUMBER: $PR_TITLE"
+                echo "Author: $PR_AUTHOR"
+                
+                # Your test commands here
+                # Note: In PR List mode, repository is not cloned
+                # This is just metadata
+
+  # Job 2: Full test workflow for specific PR (Single PR Mode)
+  - name: test-specific-pr
+    public: true
+    plan:
+      - get: specific-pr
+        trigger: true
+      
+      # Set pending status
+      - put: specific-pr
+        params:
+          path: specific-pr
+          status: pending
+          context: concourse/tests
+          description: Running tests...
+      
+      # Run tests
+      - task: test
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: golang
+              tag: "1.22"
+          
+          inputs:
+            - name: specific-pr
+          
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                cd specific-pr
+                
+                # Repository is cloned and PR is merged
+                echo "Running tests..."
+                go test -v ./...
+        
+        on_success:
+          do:
+            - put: specific-pr
+              params:
+                path: specific-pr
+                status: success
+                context: concourse/tests
+                description: All tests passed!
+                comment: |
+                  ✅ Tests passed successfully!
+                  
+                  Build: $BUILD_PIPELINE_NAME/$BUILD_JOB_NAME/$BUILD_NAME
+        
+        on_failure:
+          do:
+            - put: specific-pr
+              params:
+                path: specific-pr
+                status: failure
+                context: concourse/tests
+                description: Tests failed
+                comment: |
+                  ❌ Tests failed!
+                  
+                  Please check the build logs: $ATC_EXTERNAL_URL/builds/$BUILD_ID
+
+  # Job 3: Advanced - Multiple checks with different integration tools
+  - name: comprehensive-test
+    public: true
+    plan:
+      - get: specific-pr
+        trigger: true
+      
+      # Test with merge
+      - task: test-merge
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: golang, tag: "1.22"}
+          inputs:
+            - name: specific-pr
+              params:
+                integration_tool: merge
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                cd specific-pr
+                echo "Testing with merge strategy"
+                go test ./...
+      
+      # Test with rebase
+      - task: test-rebase
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: golang, tag: "1.22"}
+          inputs:
+            - name: specific-pr
+          params:
+            integration_tool: rebase
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                cd specific-pr
+                echo "Testing with rebase strategy"
+                go test ./...
+
+  # Job 4: Backend PR testing with path filtering
+  - name: test-backend
+    public: true
+    plan:
+      - get: backend-prs
+        trigger: true
+        version: every
+      
+      - task: notify
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: alpine}
+          inputs:
+            - name: backend-prs
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                PR=$(cat backend-prs/.git/resource/pr)
+                echo "Backend PR #$PR has changes - running backend tests"
+
+  # Job 5: Example with changed files list
+  - name: check-changed-files
+    public: true
+    plan:
+      - get: specific-pr
+        trigger: true
+        params:
+          list_changed_files: true
+      
+      - task: analyze-changes
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: alpine}
+          inputs:
+            - name: specific-pr
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                echo "Changed files:"
+                cat specific-pr/.git/resource/changed_files
+                
+                CHANGED_COUNT=$(cat specific-pr/.git/resource/changed_files_count)
+                echo "Total files changed: $CHANGED_COUNT"
+                
+                if grep -q "go.mod" specific-pr/.git/resource/changed_files; then
+                  echo "⚠️  Dependencies changed - may need extra review"
+                fi
+
+groups:
+  - name: all
+    jobs:
+      - test-prs
+      - test-specific-pr
+      - comprehensive-test
+      - test-backend
+      - check-changed-files
+  
+  - name: pr-list
+    jobs:
+      - test-prs
+      - test-backend
+  
+  - name: single-pr
+    jobs:
+      - test-specific-pr
+      - comprehensive-test
+      - check-changed-files

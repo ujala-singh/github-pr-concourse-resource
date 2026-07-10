@@ -1,0 +1,133 @@
+version: '3'
+
+tasks:
+  default:
+    desc: "Show available tasks"
+    cmds:
+      - task --list
+
+  build:
+    desc: "Build all binaries"
+    cmds:
+      - mkdir -p bin
+      - go build -o bin/check ./cmd/check
+      - go build -o bin/in ./cmd/in
+      - go build -o bin/out ./cmd/out
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - bin/check
+      - bin/in
+      - bin/out
+
+  test:
+    desc: "Run all tests"
+    cmds:
+      - go test -v ./...
+
+  test-coverage:
+    desc: "Run tests with coverage"
+    cmds:
+      - go test -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+      - echo "Coverage report generated: coverage.html"
+
+  test-e2e:
+    desc: "Run e2e tests (requires GITHUB_ACCESS_TOKEN)"
+    cmds:
+      - |
+        if [ -z "$GITHUB_ACCESS_TOKEN" ]; then
+          echo "❌ GITHUB_ACCESS_TOKEN environment variable is required"
+          echo "   export GITHUB_ACCESS_TOKEN=your_token_here"
+          exit 1
+        fi
+      - go test -v -tags=e2e ./e2e/...
+
+  test-e2e-verbose:
+    desc: "Run e2e tests with verbose output"
+    cmds:
+      - |
+        if [ -z "$GITHUB_ACCESS_TOKEN" ]; then
+          echo "❌ GITHUB_ACCESS_TOKEN environment variable is required"
+          echo "   export GITHUB_ACCESS_TOKEN=your_token_here"
+          exit 1
+        fi
+      - go test -v -tags=e2e ./e2e/... -v
+
+  test-all:
+    desc: "Run all tests including e2e"
+    cmds:
+      - task: test
+      - task: test-e2e
+
+  lint:
+    desc: "Run linters"
+    cmds:
+      - go vet ./...
+      - go fmt ./...
+      - |
+        if command -v golangci-lint >/dev/null 2>&1; then
+          golangci-lint run
+        else
+          echo "golangci-lint not installed, skipping"
+        fi
+
+  tidy:
+    desc: "Tidy and verify Go modules"
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  docker-build:
+    desc: "Build Docker image"
+    vars:
+      REGISTRY: '{{.REGISTRY | default "jolly3"}}'
+      VERSION: '{{.VERSION | default "v1.0.0"}}'
+    cmds:
+      - docker build -t {{.REGISTRY}}/github-pr-concourse-resource:latest -t {{.REGISTRY}}/github-pr-concourse-resource:{{.VERSION}} .
+
+  docker-build-test:
+    desc: "Build Docker image and test it"
+    deps: [docker-build]
+    vars:
+      REGISTRY: '{{.REGISTRY | default "jolly3"}}'
+    cmds:
+      - docker run --rm {{.REGISTRY}}/github-pr-concourse-resource:latest /opt/resource/check --help || true
+      - echo "Docker image built successfully"
+
+  docker-push:
+    desc: "Push Docker image to registry"
+    vars:
+      REGISTRY: '{{.REGISTRY | default "jolly3"}}'
+      VERSION: '{{.VERSION | default "v1.0.0"}}'
+    cmds:
+      - docker push {{.REGISTRY}}/github-pr-concourse-resource:latest
+      - docker push {{.REGISTRY}}/github-pr-concourse-resource:{{.VERSION}}
+      - echo "✅ Successfully pushed to {{.REGISTRY}}"
+
+  clean:
+    desc: "Clean build artifacts"
+    cmds:
+      - rm -rf bin/
+      - rm -f coverage.out coverage.html
+
+  deps:
+    desc: "Download dependencies"
+    cmds:
+      - go mod download
+
+  verify:
+    desc: "Verify code quality"
+    deps: [tidy, lint, test]
+
+  ci:
+    desc: "Run full CI pipeline"
+    deps: [verify, build, docker-build]
+
+  install-tools:
+    desc: "Install development tools"
+    cmds:
+      - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+      - go install github.com/maxbrunsfeld/counterfeiter/v6@latest
