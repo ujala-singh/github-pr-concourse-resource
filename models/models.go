@@ -154,17 +154,16 @@ func NewGithubClient(config CommonConfig, githubConfig GithubConfig) (*GithubCli
 	var v4Client *githubv4.Client
 
 	// Setup V3 client
+	v3Client = github.NewClient(tc)
 	if config.V3Endpoint != "" {
 		baseURL, err := url.Parse(config.V3Endpoint)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse v3 endpoint: %w", err)
 		}
-		v3Client, err = github.NewEnterpriseClient(baseURL.String(), baseURL.String(), tc)
+		v3Client, err = v3Client.WithEnterpriseURLs(baseURL.String(), baseURL.String())
 		if err != nil {
-			return nil, fmt.Errorf("failed to create v3 client: %w", err)
+			return nil, fmt.Errorf("failed to set enterprise URLs: %w", err)
 		}
-	} else {
-		v3Client = github.NewClient(tc)
 	}
 
 	// Setup V4 client

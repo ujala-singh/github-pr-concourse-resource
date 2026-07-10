@@ -1,7 +1,6 @@
 package prlist
 
 import (
-	"context"
 	"testing"
 
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
@@ -98,22 +97,6 @@ func TestFilterNewVersions(t *testing.T) {
 			}
 		})
 	}
-}
-
-// Mock GitHub client for testing
-type mockGithubClient struct {
-	prs         []*models.PullRequest
-	pathsMatch  bool
-	getError    error
-	filterError error
-}
-
-func (m *mockGithubClient) GetPullRequests(ctx context.Context) ([]*models.PullRequest, error) {
-	return m.prs, m.getError
-}
-
-func (m *mockGithubClient) MatchesPathFilters(ctx context.Context, pr *models.PullRequest) (bool, error) {
-	return m.pathsMatch, m.filterError
 }
 
 func TestCheckRequest_Validate(t *testing.T) {
