@@ -326,3 +326,66 @@ func TestCommonConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestGithubClient_GetAccessToken(t *testing.T) {
+	t.Run("returns access token when configured with PAT", func(t *testing.T) {
+		config := CommonConfig{
+			Repository:  "owner/repo",
+			AccessToken: "ghp_test_personal_access_token",
+		}
+		githubConfig := GithubConfig{}
+
+		client, err := NewGithubClient(config, githubConfig)
+		require.NoError(t, err)
+
+		token, err := client.GetAccessToken(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "ghp_test_personal_access_token", token)
+	})
+
+	t.Run("generates installation token when configured with GitHub App", func(t *testing.T) {
+		// Create mock server for GitHub App API
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Verify JWT is in Authorization header
+			auth := r.Header.Get("Authorization")
+			assert.True(t, strings.HasPrefix(auth, "Bearer "))
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
+		}))
+		defer server.Close()
+
+		config := CommonConfig{
+			Repository:              "owner/repo",
+			GithubAppID:             "12345",
+			GithubAppInstallationID: "67890",
+			GithubAppPrivateKey:     testPrivateKey,
+			V3Endpoint:              server.URL,
+			V4Endpoint:              server.URL + "/graphql",
+			HostingEndpoint:         server.URL,
+		}
+		githubConfig := GithubConfig{}
+
+		client, err := NewGithubClient(config, githubConfig)
+		require.NoError(t, err)
+
+		token, err := client.GetAccessToken(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, "ghs_test_installation_token", token)
+	})
+
+	t.Run("returns error when no authentication method configured", func(t *testing.T) {
+		// Create a client with no authentication (this shouldn't be possible via NewGithubClient
+		// due to validation, but we test the GetAccessToken logic directly)
+		client := &GithubClient{
+			Config: CommonConfig{
+				Repository: "owner/repo",
+			},
+		}
+
+		_, err := client.GetAccessToken(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no authentication method configured")
+	})
+}
