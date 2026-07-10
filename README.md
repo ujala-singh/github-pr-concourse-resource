@@ -90,12 +90,41 @@ resources:
 
 ## Source Configuration
 
+### Authentication
+
+You can authenticate with either a **personal access token** or **GitHub App credentials** (recommended).
+
+#### Personal Access Token
+
+```yaml
+source:
+  repository: owner/repo
+  access_token: ((github-token))
+```
+
+#### GitHub App (Recommended)
+
+```yaml
+source:
+  repository: owner/repo
+  github_app_id: ((github-app-id))
+  github_app_installation_id: ((github-app-installation-id))
+  github_app_private_key: ((github-app-private-key))
+```
+
+See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for detailed setup instructions.
+
 ### Common Configuration (Both Modes)
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `repository` | Yes | - | Repository in `owner/repo` format |
-| `access_token` | Yes | - | GitHub personal access token with `repo` scope |
+| `access_token` | No* | - | GitHub personal access token with `repo` scope |
+| `github_app_id` | No* | - | GitHub App ID |
+| `github_app_installation_id` | No* | - | GitHub App Installation ID |
+| `github_app_private_key` | No* | - | GitHub App private key (PEM format) |
+
+*Note: Either `access_token` OR all three GitHub App parameters (`github_app_id`, `github_app_installation_id`, `github_app_private_key`) must be provided.
 | `v3_endpoint` | No | `https://api.github.com` | GitHub API v3 endpoint (for GitHub Enterprise) |
 | `v4_endpoint` | No | `https://api.github.com/graphql` | GitHub API v4 endpoint (for GitHub Enterprise) |
 | `hosting_endpoint` | No | `https://github.com` | GitHub hosting endpoint (for GitHub Enterprise) |
