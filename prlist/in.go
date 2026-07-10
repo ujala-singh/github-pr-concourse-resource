@@ -4,16 +4,47 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
 
 // In performs the in operation for PR list mode
-// Fetches metadata about the PR without cloning the repository
+// Clones the repository and checks out the PR commit
 func In(request InRequest, github *models.GithubClient, destinationDir string) (InResponse, error) {
 	ctx := context.Background()
+
+	// Handle skip_download parameter
+	if request.Params.SkipDownload {
+		// Just create minimal metadata without cloning
+		prNumber, err := strconv.Atoi(request.Version.PR)
+		if err != nil {
+			return InResponse{}, fmt.Errorf("invalid PR number: %w", err)
+		}
+
+		pr, err := github.GetPullRequest(ctx, prNumber)
+		if err != nil {
+			return InResponse{}, fmt.Errorf("failed to get pull request: %w", err)
+		}
+
+		metadata := []models.Metadata{
+			{Name: "pr", Value: strconv.Itoa(pr.Number)},
+			{Name: "url", Value: pr.URL},
+			{Name: "head_sha", Value: request.Version.Commit},
+		}
+
+		if err := writeMetadataFiles(destinationDir, metadata, request.Version); err != nil {
+			return InResponse{}, fmt.Errorf("failed to write metadata: %w", err)
+		}
+
+		return InResponse{
+			Version:  request.Version,
+			Metadata: metadata,
+		}, nil
+	}
 
 	prNumber, err := strconv.Atoi(request.Version.PR)
 	if err != nil {
@@ -23,6 +54,30 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 	pr, err := github.GetPullRequest(ctx, prNumber)
 	if err != nil {
 		return InResponse{}, fmt.Errorf("failed to get pull request: %w", err)
+	}
+
+	// Get access token for git operations
+	accessToken, err := github.GetAccessToken(ctx)
+	if err != nil {
+		return InResponse{}, fmt.Errorf("failed to get access token: %w", err)
+	}
+
+	// Clone the base branch
+	owner, repo := github.Config.GetOwnerAndRepo()
+	repoURL := buildRepoURL(github.Config, owner, repo, accessToken)
+
+	if err := cloneRepo(repoURL, pr.BaseRefName, destinationDir, request.Params.GitDepth); err != nil {
+		return InResponse{}, fmt.Errorf("failed to clone repository: %w", err)
+	}
+
+	// Fetch the PR
+	if err := fetchPR(destinationDir, prNumber); err != nil {
+		return InResponse{}, fmt.Errorf("failed to fetch PR: %w", err)
+	}
+
+	// Checkout the specific commit
+	if err := checkoutCommit(destinationDir, request.Version.Commit); err != nil {
+		return InResponse{}, fmt.Errorf("failed to checkout commit: %w", err)
 	}
 
 	// Create metadata
@@ -86,4 +141,48 @@ func writeMetadataFiles(destDir string, metadata []models.Metadata, version mode
 	}
 
 	return nil
+}
+
+// Git helper functions
+
+func buildRepoURL(config models.CommonConfig, owner, repo, token string) string {
+	if config.HostingEndpoint != "" {
+		return fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git",
+			token,
+			strings.TrimPrefix(config.HostingEndpoint, "https://"),
+			owner, repo)
+	}
+	return fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git",
+		token, owner, repo)
+}
+
+func cloneRepo(repoURL, branch, destination string, depth int) error {
+	args := []string{"clone", "--single-branch", "--branch", branch}
+
+	if depth > 0 {
+		args = append(args, "--depth", strconv.Itoa(depth))
+	}
+
+	args = append(args, "--no-tags", repoURL, destination)
+
+	cmd := exec.Command("git", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func fetchPR(repoDir string, prNumber int) error {
+	cmd := exec.Command("git", "fetch", "origin", fmt.Sprintf("pull/%d/head", prNumber))
+	cmd.Dir = repoDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func checkoutCommit(repoDir, sha string) error {
+	cmd := exec.Command("git", "checkout", "-q", sha)
+	cmd.Dir = repoDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }

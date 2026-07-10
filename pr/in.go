@@ -38,9 +38,15 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 		return InResponse{}, fmt.Errorf("failed to get pull request: %w", err)
 	}
 
+	// Get access token for git operations
+	accessToken, err := github.GetAccessToken(ctx)
+	if err != nil {
+		return InResponse{}, fmt.Errorf("failed to get access token: %w", err)
+	}
+
 	// Clone the base branch
 	owner, repo := github.Config.GetOwnerAndRepo()
-	repoURL := buildRepoURL(github.Config, owner, repo)
+	repoURL := buildRepoURL(github.Config, owner, repo, accessToken)
 
 	if err := cloneRepo(repoURL, pr.BaseRefName, destinationDir, request.Params.GitDepth, request.Params.FetchTags); err != nil {
 		return InResponse{}, fmt.Errorf("failed to clone repository: %w", err)
@@ -142,15 +148,15 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 
 // Git helper functions
 
-func buildRepoURL(config models.CommonConfig, owner, repo string) string {
+func buildRepoURL(config models.CommonConfig, owner, repo, token string) string {
 	if config.HostingEndpoint != "" {
 		return fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git",
-			config.AccessToken,
+			token,
 			strings.TrimPrefix(config.HostingEndpoint, "https://"),
 			owner, repo)
 	}
 	return fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git",
-		config.AccessToken, owner, repo)
+		token, owner, repo)
 }
 
 func cloneRepo(repoURL, branch, destination string, depth int, fetchTags bool) error {
