@@ -32,6 +32,8 @@ cmd/in/in
 cmd/out/out
 dist/
 build/
+.task/
+bin/
 
 # OS specific
 .DS_Store
