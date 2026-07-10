@@ -15,20 +15,23 @@ import (
 
 // CommonConfig contains configuration common to all resource types
 type CommonConfig struct {
-	Repository          string   `json:"repository"`
-	AccessToken         string   `json:"access_token"`
-	V3Endpoint          string   `json:"v3_endpoint"`
-	V4Endpoint          string   `json:"v4_endpoint"`
-	HostingEndpoint     string   `json:"hosting_endpoint"`
-	SkipSSLVerification bool     `json:"skip_ssl_verification"`
-	Paths               []string `json:"paths"`
-	IgnorePaths         []string `json:"ignore_paths"`
-	DisableCISkip       bool     `json:"disable_ci_skip"`
-	DisableForks        bool     `json:"disable_forks"`
-	IgnoreDrafts        bool     `json:"ignore_drafts"`
-	BaseBranch          string   `json:"base_branch"`
-	Labels              []string `json:"labels"`
-	States              []string `json:"states"`
+	Repository              string   `json:"repository"`
+	AccessToken             string   `json:"access_token"`
+	V3Endpoint              string   `json:"v3_endpoint"`
+	V4Endpoint              string   `json:"v4_endpoint"`
+	HostingEndpoint         string   `json:"hosting_endpoint"`
+	GithubAppID             string   `json:"github_app_id"`
+	GithubAppInstallationID string   `json:"github_app_installation_id"`
+	GithubAppPrivateKey     string   `json:"github_app_private_key"`
+	SkipSSLVerification     bool     `json:"skip_ssl_verification"`
+	Paths                   []string `json:"paths"`
+	IgnorePaths             []string `json:"ignore_paths"`
+	DisableCISkip           bool     `json:"disable_ci_skip"`
+	DisableForks            bool     `json:"disable_forks"`
+	IgnoreDrafts            bool     `json:"ignore_drafts"`
+	BaseBranch              string   `json:"base_branch"`
+	Labels                  []string `json:"labels"`
+	States                  []string `json:"states"`
 }
 
 // GithubConfig contains GitHub-specific configuration
@@ -43,8 +46,30 @@ func (c *CommonConfig) Validate() error {
 	if c.Repository == "" {
 		return fmt.Errorf("repository must be set")
 	}
-	if c.AccessToken == "" {
-		return fmt.Errorf("access_token must be set")
+
+	// Check authentication method
+	hasToken := c.AccessToken != ""
+	hasGithubApp := c.GithubAppID != "" && c.GithubAppInstallationID != "" && c.GithubAppPrivateKey != ""
+
+	if !hasToken && !hasGithubApp {
+		return fmt.Errorf("either access_token or github_app credentials (github_app_id, github_app_installation_id, github_app_private_key) must be set")
+	}
+
+	if hasToken && hasGithubApp {
+		return fmt.Errorf("cannot use both access_token and github_app authentication")
+	}
+
+	// Validate GitHub App fields if using GitHub App auth
+	if hasGithubApp {
+		if c.GithubAppID == "" {
+			return fmt.Errorf("github_app_id must be set when using GitHub App authentication")
+		}
+		if c.GithubAppInstallationID == "" {
+			return fmt.Errorf("github_app_installation_id must be set when using GitHub App authentication")
+		}
+		if c.GithubAppPrivateKey == "" {
+			return fmt.Errorf("github_app_private_key must be set when using GitHub App authentication")
+		}
 	}
 
 	// Validate repository format
@@ -94,7 +119,6 @@ type GithubClient struct {
 // NewGithubClient creates a new GitHub client with the given configuration
 func NewGithubClient(config CommonConfig, githubConfig GithubConfig) (*GithubClient, error) {
 	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.AccessToken})
 
 	var httpClient *http.Client
 	if config.SkipSSLVerification {
@@ -103,10 +127,28 @@ func NewGithubClient(config CommonConfig, githubConfig GithubConfig) (*GithubCli
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			},
 		}
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
 	}
 
-	tc := oauth2.NewClient(ctx, ts)
+	// Determine which authentication method to use
+	var ts oauth2.TokenSource
+	if config.GithubAppID != "" && config.GithubAppInstallationID != "" && config.GithubAppPrivateKey != "" {
+		// Use GitHub App authentication
+		ts = &githubAppTokenSource{
+			ctx:        ctx,
+			config:     config,
+			httpClient: httpClient,
+		}
+	} else {
+		// Use personal access token
+		ts = oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.AccessToken})
+	}
+
+	// Create OAuth2 client
+	var tc *http.Client
+	if httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	}
+	tc = oauth2.NewClient(ctx, ts)
 
 	var v3Client *github.Client
 	var v4Client *githubv4.Client
