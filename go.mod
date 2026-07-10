@@ -1,6 +1,6 @@
 module github.com/ujala-singh/github-pr-concourse-resource
 
-go 1.26
+go 1.23.0
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
