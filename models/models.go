@@ -181,6 +181,21 @@ func NewGithubClient(config CommonConfig, githubConfig GithubConfig) (*GithubCli
 	}, nil
 }
 
+// GetAccessToken returns a valid access token for git operations
+func (c *GithubClient) GetAccessToken(ctx context.Context) (string, error) {
+	// If using personal access token, return it directly
+	if c.Config.AccessToken != "" {
+		return c.Config.AccessToken, nil
+	}
+
+	// If using GitHub App, generate an installation token
+	if c.Config.GithubAppID != "" && c.Config.GithubAppInstallationID != "" && c.Config.GithubAppPrivateKey != "" {
+		return getGithubAppToken(ctx, c.Config, nil)
+	}
+
+	return "", fmt.Errorf("no authentication method configured")
+}
+
 // Version represents a resource version
 type Version struct {
 	PR                  string `json:"pr"`

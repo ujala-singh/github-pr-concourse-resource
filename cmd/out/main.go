@@ -32,7 +32,9 @@ func main() {
 		log.Fatalf("failed to unmarshal request: %v", err)
 	}
 
-	if err := request.Source.Validate(); err != nil {
+	// Skip number validation for out operations - the PR number will be read from the path
+	// Only validate CommonConfig (repository, auth, etc.)
+	if err := request.Source.CommonConfig.Validate(); err != nil {
 		log.Fatalf("invalid source configuration: %v", err)
 	}
 
