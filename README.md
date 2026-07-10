@@ -373,41 +373,7 @@ go test -cover ./...
 
 # Run with coverage report
 task test-coverage
-
-# Run e2e tests (requires GITHUB_ACCESS_TOKEN)
-export GITHUB_ACCESS_TOKEN=your_token_here
-task test-e2e
-
-# Run all tests including e2e
-task test-all
 ```
-
-#### E2E Tests
-
-End-to-end tests verify functionality against real GitHub repositories. See [e2e/README.md](e2e/README.md) for detailed setup instructions.
-
-**Quick start:**
-```bash
-# Set up token
-export GITHUB_ACCESS_TOKEN="your_github_token"
-
-# Optional: specify test repository
-export TEST_REPOSITORY="owner/repo"
-
-# Run e2e tests
-go test -v -tags=e2e ./e2e/...
-```
-
-**What's tested:**
-- ✅ Check operation (both PR and PR list modes)
-- ✅ In operation (merge, rebase, checkout strategies)
-- ✅ Out operation (status updates, comments)
-- ✅ Path filtering (include/exclude patterns)
-- ✅ API cost optimization
-- ✅ Metadata file generation
-
-**CI Integration:**
-E2E tests run automatically in CI using GitHub's automatic `GITHUB_TOKEN` (no setup required).
 
 ## Differences from Other Resources
 
