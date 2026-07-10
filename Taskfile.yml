@@ -32,7 +32,7 @@ tasks:
     cmds:
       - go test -coverprofile=coverage.out ./...
       - go tool cover -html=coverage.out -o coverage.html
-      - echo "Coverage report generated: coverage.html"
+      - 'echo "Coverage report generated: coverage.html"'
 
   lint:
     desc: "Run linters"
@@ -67,7 +67,7 @@ tasks:
       REGISTRY: '{{.REGISTRY | default "jolly3"}}'
     cmds:
       - docker run --rm {{.REGISTRY}}/github-pr-concourse-resource:latest /opt/resource/check --help || true
-      - echo "Docker image built successfully"
+      - 'echo "Docker image built successfully"'
 
   docker-push:
     desc: "Push Docker image to registry"
@@ -77,7 +77,7 @@ tasks:
     cmds:
       - docker push {{.REGISTRY}}/github-pr-concourse-resource:latest
       - docker push {{.REGISTRY}}/github-pr-concourse-resource:{{.VERSION}}
-      - echo "✅ Successfully pushed to {{.REGISTRY}}"
+      - 'echo "✅ Successfully pushed to {{.REGISTRY}}"'
 
   clean:
     desc: "Clean build artifacts"
