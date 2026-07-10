@@ -34,34 +34,6 @@ tasks:
       - go tool cover -html=coverage.out -o coverage.html
       - echo "Coverage report generated: coverage.html"
 
-  test-e2e:
-    desc: "Run e2e tests (requires GITHUB_ACCESS_TOKEN)"
-    cmds:
-      - |
-        if [ -z "$GITHUB_ACCESS_TOKEN" ]; then
-          echo "❌ GITHUB_ACCESS_TOKEN environment variable is required"
-          echo "   export GITHUB_ACCESS_TOKEN=your_token_here"
-          exit 1
-        fi
-      - go test -v -tags=e2e ./e2e/...
-
-  test-e2e-verbose:
-    desc: "Run e2e tests with verbose output"
-    cmds:
-      - |
-        if [ -z "$GITHUB_ACCESS_TOKEN" ]; then
-          echo "❌ GITHUB_ACCESS_TOKEN environment variable is required"
-          echo "   export GITHUB_ACCESS_TOKEN=your_token_here"
-          exit 1
-        fi
-      - go test -v -tags=e2e ./e2e/... -v
-
-  test-all:
-    desc: "Run all tests including e2e"
-    cmds:
-      - task: test
-      - task: test-e2e
-
   lint:
     desc: "Run linters"
     cmds:
