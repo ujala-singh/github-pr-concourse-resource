@@ -1,0 +1,8 @@
+# Code Owners for github-pr-concourse-resource
+# This file defines who will be automatically requested for review
+# when a pull request modifies certain files or directories.
+#
+# More information: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Global owner - all files
+* @ujala-singh
