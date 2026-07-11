@@ -211,8 +211,6 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `github_app_id` | No* | - | GitHub App ID |
 | `github_app_installation_id` | No* | - | GitHub App Installation ID |
 | `github_app_private_key` | No* | - | GitHub App private key (PEM format) |
-
-*Note: Either `access_token` OR all three GitHub App parameters (`github_app_id`, `github_app_installation_id`, `github_app_private_key`) must be provided.
 | `v3_endpoint` | No | `https://api.github.com` | GitHub API v3 endpoint (for GitHub Enterprise) |
 | `v4_endpoint` | No | `https://api.github.com/graphql` | GitHub API v4 endpoint (for GitHub Enterprise) |
 | `hosting_endpoint` | No | `https://github.com` | GitHub hosting endpoint (for GitHub Enterprise) |
@@ -225,6 +223,8 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `base_branch` | No | - | Only trigger on PRs targeting this branch |
 | `labels` | No | `[]` | Only trigger on PRs with at least one of these labels |
 | `states` | No | `["OPEN"]` | PR states to track: `OPEN`, `MERGED`, `CLOSED` |
+
+> **Note:** Either `access_token` OR all three GitHub App parameters (`github_app_id`, `github_app_installation_id`, `github_app_private_key`) must be provided.
 
 ### PR List Mode Configuration
 
