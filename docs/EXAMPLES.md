@@ -2,6 +2,8 @@
 
 Comprehensive examples for common CI/CD scenarios.
 
+> 💡 **Quick Start:** Looking for a complete, ready-to-use pipeline? Check out [`examples/pipeline.yml`](../examples/pipeline.yml) which demonstrates all features in a single working pipeline file.
+
 ## Table of Contents
 
 - [PR List Mode Examples](#pr-list-mode-examples)
