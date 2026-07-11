@@ -152,7 +152,3 @@ The GitHub App needs these permissions:
 | Pull requests | Read & Write | Reading PR data, posting comments |
 | Commit statuses | Read & Write | Setting commit status (e.g., pending, success) |
 | Metadata | Read | Basic repository metadata (automatic) |
-
-## Implementation Reference
-
-This implementation is based on [telia-oss/github-pr-resource#286](https://github.com/telia-oss/github-pr-resource/pull/286).
