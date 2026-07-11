@@ -4,6 +4,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io-2088FF?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/pkgs/container/github-pr-concourse-resource)
+[![Attestations](https://img.shields.io/badge/Attestations-SLSA%20Provenance-green?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/attestations)
 
 A modern, feature-rich Concourse CI resource for GitHub Pull Requests with dual-mode support and GitHub App authentication.
 
