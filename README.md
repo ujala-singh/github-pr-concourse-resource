@@ -1,34 +1,58 @@
 # GitHub PR Concourse Resource
 
-A modern, feature-rich Concourse CI resource for GitHub Pull Requests with dual-mode support.
+[![CI Status](https://github.com/ujala-singh/github-pr-concourse-resource/workflows/CI/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions)
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GHCR](https://ghcr-badge.egpl.dev/ujala-singh/github-pr-concourse-resource/latest_tag?color=%2344cc11&ignore=latest&label=GHCR&trim=)](https://github.com/ujala-singh/github-pr-concourse-resource/pkgs/container/github-pr-concourse-resource)
 
-## Features
+A modern, feature-rich Concourse CI resource for GitHub Pull Requests with dual-mode support and GitHub App authentication.
 
-✨ **Dual Mode Operation**
-- **PR List Mode**: Track all PRs matching criteria (for instance pipelines)
-- **Single PR Mode**: Track commits to a specific PR
+## 🌟 Features
 
-🔐 **Security & Filtering**
-- Required review approvals
+### ✨ Dual Mode Operation
+- **PR List Mode**: Track all PRs matching criteria (perfect for instance pipelines)
+- **Single PR Mode**: Track commits to a specific PR (ideal for commit-based testing)
+
+### 🔐 Advanced Security & Authentication
+- **GitHub App Authentication** (recommended) - No shared tokens, automatic token rotation
+- Personal Access Token support
+- Required review approvals enforcement
 - Draft PR filtering
 - Fork repository filtering  
-- Path-based filtering (include/exclude patterns)
-- Label-based filtering
-- Base branch filtering
-- PR state filtering (OPEN, MERGED, CLOSED)
 
-🎯 **Smart Integration**
+### 🎯 Smart Filtering & Integration
+- **Path-based filtering** with glob patterns (include/exclude)
+- **Label-based filtering** for workflow control
+- Base branch targeting
+- PR state filtering (OPEN, MERGED, CLOSED)
 - Multiple integration strategies (merge, rebase, checkout)
 - Commit status updates
 - PR comments
-- Changed files list
-- Submodule support
+- Changed files detection
+
+### ⚡ Performance & Flexibility
+- Shallow cloning support
+- Git submodules support
 - Git LFS support
 - Configurable git depth
+- Multi-architecture support (amd64, arm64)
 
-## Installation
+## 📦 Installation
 
-### From jolly3 Registry
+### Option 1: GitHub Container Registry (Recommended)
+
+```yaml
+resource_types:
+  - name: github-pr
+    type: registry-image
+    source:
+      repository: ghcr.io/ujala-singh/github-pr-concourse-resource
+      tag: latest
+      # Or use a specific version tag:
+      # tag: v1.0.0
+```
+
+### Option 2: Docker Hub
 
 ```yaml
 resource_types:
@@ -37,21 +61,81 @@ resource_types:
     source:
       repository: jolly3/github-pr-concourse-resource
       tag: latest
-      # Or use a specific version:
-      # tag: v1.0.0
 ```
 
-### Building from Source
+### Option 3: Building from Source
+
+**Requirements:**
+- Go 1.23 or higher
+- Docker (for containerization)
 
 ```bash
-# Build Docker image
-docker build -t jolly3/github-pr-concourse-resource:latest .
+# Clone the repository
+git clone https://github.com/ujala-singh/github-pr-concourse-resource.git
+cd github-pr-concourse-resource
 
-# Push to registry
-docker push jolly3/github-pr-concourse-resource:latest
+# Build Docker image
+docker build -t github-pr-concourse-resource:latest .
+
+# Run tests
+go test -v -race -cover ./...
+
+# Push to your registry
+docker tag github-pr-concourse-resource:latest your-registry.com/github-pr-concourse-resource:latest
+docker push your-registry.com/github-pr-concourse-resource:latest
 ```
 
-## Modes of Operation
+## 📋 Prerequisites
+
+- Concourse CI 7.0 or higher
+- GitHub repository with appropriate permissions
+- One of the following authentication methods:
+  - **GitHub App** (recommended) - [Setup Guide](docs/GITHUB_APP_AUTHENTICATION.md)
+  - Personal Access Token with `repo` scope
+
+## 🚀 Quick Start
+
+See our [Quick Start Guide](docs/QUICKSTART.md) for a step-by-step tutorial.
+
+### Minimal Working Example
+
+```yaml
+resource_types:
+  - name: github-pr
+    type: registry-image
+    source:
+      repository: ghcr.io/ujala-singh/github-pr-concourse-resource
+
+resources:
+  - name: pull-requests
+    type: github-pr
+    source:
+      repository: owner/repo
+      access_token: ((github-token))
+
+jobs:
+  - name: test-pr
+    plan:
+      - get: pull-requests
+        trigger: true
+      - task: run-tests
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: golang, tag: "1.23"}
+          inputs:
+            - name: pull-requests
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                cd pull-requests
+                go test ./...
+```
+
+## 🎭 Modes of Operation
 
 ### Mode 1: PR List (Instance Pipelines)
 
@@ -348,63 +432,261 @@ jobs:
           list_changed_files: true
 ```
 
-## Development
+## 🛠️ Development
 
-### Building
+### Building Locally
+
+**Requirements:**
+- Go 1.23 or higher
+- Docker 24.0 or higher
+- Git 2.40 or higher
 
 ```bash
+# Clone repository
+git clone https://github.com/ujala-singh/github-pr-concourse-resource.git
+cd github-pr-concourse-resource
+
+# Install dependencies
+go mod download
+
 # Build binaries
-go build -o cmd/check/check ./cmd/check
-go build -o cmd/in/in ./cmd/in
-go build -o cmd/out/out ./cmd/out
+go build -o bin/check ./cmd/check
+go build -o bin/in ./cmd/in
+go build -o bin/out ./cmd/out
 
 # Build Docker image
-docker build -t github-pr-concourse-resource .
+docker build -t github-pr-concourse-resource:dev .
+
+# Run locally (for testing)
+docker run -i github-pr-concourse-resource:dev /opt/resource/check < check-request.json
 ```
 
 ### Testing
 
 ```bash
-# Run unit tests
+# Run all tests
 go test ./...
+
+# Run with verbose output
+go test -v ./...
+
+# Run with race detection
+go test -race ./...
 
 # Run with coverage
 go test -cover ./...
 
-# Run with coverage report
-task test-coverage
+# Generate coverage report
+go test -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
+
+# Run specific test
+go test ./models -run TestGetAccessToken
+
+# Run tests in watch mode (requires entr)
+find . -name "*.go" | entr -c go test ./...
 ```
 
-## Differences from Other Resources
+### Code Quality
 
-### vs. `github-pr-resource` (telia-oss)
-- ✅ Adds PR list mode for instance pipelines
-- ✅ More filtering options
-- ✅ Modern Go dependencies
-- ✅ Better path filtering
+```bash
+# Format code
+go fmt ./...
 
-### vs. `github-pr-instances-resource` (aoldershaw)
+# Run linter (requires golangci-lint)
+golangci-lint run
+
+# Vet code
+go vet ./...
+
+# Static analysis
+staticcheck ./...
+```
+
+### Project Structure
+
+```
+.
+├── cmd/
+│   ├── check/          # Check for new versions
+│   ├── in/             # Fetch resource
+│   └── out/            # Update resource (status/comments)
+├── models/             # Core data models and GitHub client
+│   ├── github_app.go   # GitHub App authentication
+│   └── models.go       # Data structures
+├── pr/                 # Single PR mode implementation
+├── prlist/             # PR List mode implementation
+├── docs/               # Comprehensive documentation
+│   ├── QUICKSTART.md
+│   ├── ARCHITECTURE.md
+│   ├── IMPLEMENTATION.md
+│   └── GITHUB_APP_AUTHENTICATION.md
+└── Dockerfile          # Multi-stage build configuration
+```
+
+## 🔍 Troubleshooting
+
+### Common Issues
+
+#### 1. Authentication Failures
+
+**Symptom:** `HTTP 401` or `Bad credentials` errors
+
+**Solutions:**
+- Verify your access token has `repo` scope
+- For GitHub App: Ensure all three parameters are correct
+- Check token hasn't expired
+- Verify repository access permissions
+
+```yaml
+# Debug: Enable verbose logging
+source:
+  repository: owner/repo
+  access_token: ((github-token))
+  # Test token with: curl -H "Authorization: token YOUR_TOKEN" https://api.github.com/user
+```
+
+#### 2. Resource Not Triggering
+
+**Symptom:** PRs created but pipeline doesn't trigger
+
+**Solutions:**
+- Check filter criteria (labels, base_branch, etc.)
+- Verify webhook configuration (if using webhooks)
+- Check PR meets required_review_approvals
+- Look at draft status if `ignore_drafts: true`
+
+```bash
+# Debug check behavior
+fly -t your-target check-resource --resource pipeline/pr-resource
+```
+
+#### 3. Git Clone Failures
+
+**Symptom:** `fatal: could not read Username` or authentication errors during clone
+
+**Solutions:**
+- Ensure GitHub App installation has repository access
+- Verify private key format (must be PEM with newlines preserved)
+- Check network connectivity to GitHub
+- For private repos, confirm authentication method has access
+
+#### 4. Merge Conflicts
+
+**Symptom:** `merge conflict` during `get` step
+
+**Solutions:**
+- Use `integration_tool: rebase` instead of `merge`
+- Use `integration_tool: checkout` to skip integration
+- Address conflicts in the PR before running pipeline
+
+### Debug Mode
+
+Enable detailed logging by setting environment variables:
+
+```yaml
+jobs:
+  - name: debug-pr
+    plan:
+      - get: pull-requests
+        params:
+          skip_download: false
+        # Add environment for debugging
+        env:
+          - name: DEBUG
+            value: "true"
+```
+
+### Getting Help
+
+- 📖 Check [documentation](docs/)
+- 🐛 [Report issues](https://github.com/ujala-singh/github-pr-concourse-resource/issues)
+- 💬 [Start a discussion](https://github.com/ujala-singh/github-pr-concourse-resource/discussions)
+- 📧 Contact maintainers
+
+## 🆚 Comparison with Other Resources
+
+### vs. `telia-oss/github-pr-resource`
+- ✅ Adds PR List Mode for instance pipelines
+- ✅ GitHub App authentication support
+- ✅ More comprehensive filtering options
+- ✅ Modern Go 1.23+ with latest dependencies
+- ✅ Better path filtering with glob patterns
+- ✅ Multi-architecture support (amd64, arm64)
+
+### vs. `aoldershaw/github-pr-instances-resource`
 - ✅ Cleaner, more maintainable codebase
-- ✅ Up-to-date dependencies (Go 1.22, latest GitHub API)
+- ✅ Up-to-date dependencies (Go 1.23+, latest GitHub API)
+- ✅ Single PR mode alongside PR List mode
+- ✅ GitHub App authentication
 - ✅ Better separation of concerns
+- ✅ Comprehensive test coverage (37%+ and growing)
 - ✅ More comprehensive documentation
 
-## License
+### vs. `jtarchie/github-pullrequest-resource`
+- ✅ Active maintenance and updates
+- ✅ Modern architecture with proper separation
+- ✅ GitHub App support
+- ✅ Better filtering and configuration options
+- ✅ Dual-mode operation
+
+## 📊 Performance Considerations
+
+- **Shallow cloning**: Set `git_depth` to reduce clone time
+- **Path filtering**: Use `paths` and `ignore_paths` to reduce check frequency
+- **PR List Mode**: Scales to hundreds of PRs efficiently
+- **Multi-architecture**: Native ARM64 support for Apple Silicon and ARM servers
+
+## 🔒 Security Best Practices
+
+1. **Use GitHub Apps** instead of personal access tokens
+2. **Limit token scopes** to minimum required (`repo` for PAT)
+3. **Store secrets** in Concourse credential managers (Vault, etc.)
+4. **Enable required reviews** with `required_review_approvals`
+5. **Filter forks** with `disable_forks: true` for security-sensitive repos
+6. **Use signed commits** when possible
+7. **Regular updates**: Keep the resource image updated
+
+## 🤝 Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+### How to Contribute
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes
+4. Add/update tests
+5. Ensure tests pass (`go test ./...`)
+6. Commit your changes (`git commit -m 'feat: add amazing feature'`)
+7. Push to the branch (`git push origin feature/amazing-feature`)
+8. Open a Pull Request
+
+### Development Setup
+
+See the [Development](#-development) section above for setup instructions.
+
+## 📜 License
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-## Contributing
+## 🙏 Credits & Acknowledgments
 
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## Credits
-
-This resource combines the best features from:
+This resource combines and improves upon ideas from:
 - [telia-oss/github-pr-resource](https://github.com/telia-oss/github-pr-resource)
 - [aoldershaw/github-pr-instances-resource](https://github.com/aoldershaw/github-pr-instances-resource)
+- [jtarchie/github-pullrequest-resource](https://github.com/jtarchie/github-pullrequest-resource)
+
+Special thanks to all contributors and the Concourse CI community!
+
+## 📚 Additional Documentation
+
+- [Architecture Overview](docs/ARCHITECTURE.md)
+- [Implementation Details](docs/IMPLEMENTATION.md)
+- [GitHub App Setup](docs/GITHUB_APP_AUTHENTICATION.md)
+- [Quick Start Guide](docs/QUICKSTART.md)
+
+---
+
+**Maintained with ❤️ by the community** | [Report Issues](https://github.com/ujala-singh/github-pr-concourse-resource/issues) | [Request Features](https://github.com/ujala-singh/github-pr-concourse-resource/issues/new?template=feature_request.md)
 
