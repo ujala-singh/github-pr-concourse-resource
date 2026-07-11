@@ -1,6 +1,7 @@
 # Example Concourse Pipeline
 
-# This file demonstrates various usage patterns for the GitHub PR resource
+# This file demonstrates various usage patterns for the GitHub PR resource.
+# For detailed explanations and more focused examples, see docs/EXAMPLES.md
 
 resource_types:
   - name: github-pr

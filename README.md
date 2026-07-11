@@ -97,6 +97,10 @@ docker push your-registry.com/github-pr-concourse-resource:latest
 
 See our [Quick Start Guide](docs/QUICKSTART.md) for a step-by-step tutorial.
 
+> 📋 **Looking for more examples?**
+> - [Complete Pipeline Template](examples/pipeline.yml) - Ready-to-use pipeline with all features
+> - [Real-World Examples](docs/EXAMPLES.md) - 13 detailed scenarios with best practices
+
 ### Minimal Working Example
 
 ```yaml
@@ -681,6 +685,9 @@ Special thanks to all contributors and the Concourse CI community!
 
 ## 📚 Additional Documentation
 
+- **[Real-World Examples](docs/EXAMPLES.md)** - 13 detailed examples for common scenarios
+- **[Complete Pipeline Template](examples/pipeline.yml)** - Ready-to-use pipeline with all features
+- **[Troubleshooting Guide](docs/TROUBLESHOOTING.md)** - Solutions for common issues
 - [Architecture Overview](docs/ARCHITECTURE.md)
 - [Implementation Details](docs/IMPLEMENTATION.md)
 - [GitHub App Setup](docs/GITHUB_APP_AUTHENTICATION.md)
