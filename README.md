@@ -608,32 +608,6 @@ jobs:
 - 💬 [Start a discussion](https://github.com/ujala-singh/github-pr-concourse-resource/discussions)
 - 📧 Contact maintainers
 
-## 🆚 Comparison with Other Resources
-
-### vs. `telia-oss/github-pr-resource`
-- ✅ Adds PR List Mode for instance pipelines
-- ✅ GitHub App authentication support
-- ✅ More comprehensive filtering options
-- ✅ Modern Go 1.23+ with latest dependencies
-- ✅ Better path filtering with glob patterns
-- ✅ Multi-architecture support (amd64, arm64)
-
-### vs. `aoldershaw/github-pr-instances-resource`
-- ✅ Cleaner, more maintainable codebase
-- ✅ Up-to-date dependencies (Go 1.23+, latest GitHub API)
-- ✅ Single PR mode alongside PR List mode
-- ✅ GitHub App authentication
-- ✅ Better separation of concerns
-- ✅ Comprehensive test coverage (37%+ and growing)
-- ✅ More comprehensive documentation
-
-### vs. `jtarchie/github-pullrequest-resource`
-- ✅ Active maintenance and updates
-- ✅ Modern architecture with proper separation
-- ✅ GitHub App support
-- ✅ Better filtering and configuration options
-- ✅ Dual-mode operation
-
 ## 📊 Performance Considerations
 
 - **Shallow cloning**: Set `git_depth` to reduce clone time
@@ -674,12 +648,7 @@ See the [Development](#-development) section above for setup instructions.
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-## 🙏 Credits & Acknowledgments
-
-This resource combines and improves upon ideas from:
-- [telia-oss/github-pr-resource](https://github.com/telia-oss/github-pr-resource)
-- [aoldershaw/github-pr-instances-resource](https://github.com/aoldershaw/github-pr-instances-resource)
-- [jtarchie/github-pullrequest-resource](https://github.com/jtarchie/github-pullrequest-resource)
+## 🙏 Acknowledgments
 
 Special thanks to all contributors and the Concourse CI community!
 

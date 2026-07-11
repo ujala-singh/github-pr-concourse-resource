@@ -2,7 +2,7 @@
 
 ## Overview
 
-This is a clean, modern implementation of a GitHub Pull Request resource for Concourse CI that combines the best features from both `github-pr-resource` (telia-oss) and `github-pr-instances-resource` (aoldershaw/cloudfoundry-community).
+This is a clean, modern implementation of a GitHub Pull Request resource for Concourse CI with dual-mode support for both PR List and Single PR tracking.
 
 ## Architecture
 
@@ -14,13 +14,13 @@ The resource intelligently switches between two modes based on the presence of `
    - Tracks all PRs matching filter criteria
    - Perfect for instance pipelines
    - Returns PR metadata only (no repo clone)
-   - Implements the logic from `github-pr-instances-resource`
+   - Ideal for creating separate pipeline instances per PR
 
 2. **Single PR Mode** (`source.number` present)
    - Tracks commits to a specific PR
    - Full git operations (clone, merge, rebase)
    - Status updates and comments
-   - Implements the logic from `github-pr-resource`
+   - Ideal for commit-by-commit testing
 
 ### Package Structure
 
@@ -45,23 +45,21 @@ github-pr-concourse-resource/
     └── out/            # /opt/resource/out
 ```
 
-## Key Features Implemented
+## Key Features
 
-### From `github-pr-instances-resource`
+### Core Functionality
 ✅ PR List mode for instance pipelines
-✅ Dual-mode routing based on configuration
-✅ Enhanced security checks
-
-### From `github-pr-resource`
 ✅ Single PR commit tracking
+✅ Dual-mode routing based on configuration
 ✅ GraphQL API for efficiency
 ✅ Multiple integration tools (merge, rebase, checkout)
 ✅ Commit status updates
 ✅ PR comments
 ✅ Changed files listing
+✅ Enhanced security checks
 
-### New Improvements
-✅ Modern Go 1.23+
+### Modern Stack
+✅ Go 1.23+
 ✅ Latest GitHub API libraries (go-github v60)
 ✅ Cleaner separation of concerns
 ✅ Better error handling
@@ -132,32 +130,6 @@ task docker-build   # Build image
 # CI
 task ci             # Full CI pipeline
 ```
-
-## Comparison with Source Projects
-
-| Feature | telia-oss | aoldershaw | This Implementation |
-|---------|-----------|-----------|---------------------|
-| PR List Mode | ❌ | ✅ | ✅ |
-| Single PR Mode | ✅ | ✅ | ✅ |
-| Go Version | 1.14 | 1.20 | 1.22 |
-| GitHub API | v28 | v28 | v60 |
-| Code Structure | Flat | Split | Clean Packages |
-| Tests | ✅ | ✅ | ✅ |
-| Documentation | Good | Good | Comprehensive |
-| Taskfile | ❌ | ✅ | ✅ |
-| Examples | Good | Good | Extensive |
-
-## Migration Guide
-
-### From `github-pr-resource`
-- No changes needed for existing configurations
-- Same behavior when `source.number` is set
-- New features: PR list mode, better filtering
-
-### From `github-pr-instances-resource`
-- Configuration compatible
-- Same behavior when `source.number` is omitted
-- Improved: cleaner code, newer dependencies
 
 ## Next Steps
 
