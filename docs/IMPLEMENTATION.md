@@ -61,7 +61,7 @@ github-pr-concourse-resource/
 ✅ Changed files listing
 
 ### New Improvements
-✅ Modern Go 1.22
+✅ Modern Go 1.23+
 ✅ Latest GitHub API libraries (go-github v60)
 ✅ Cleaner separation of concerns
 ✅ Better error handling
