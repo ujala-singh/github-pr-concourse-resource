@@ -1,9 +1,9 @@
 # GitHub PR Concourse Resource
 
-[![CI Status](https://github.com/ujala-singh/github-pr-concourse-resource/workflows/CI/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions)
+[![CI Status](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/ci.yml/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![GHCR](https://ghcr-badge.egpl.dev/ujala-singh/github-pr-concourse-resource/latest_tag?color=%2344cc11&ignore=latest&label=GHCR&trim=)](https://github.com/ujala-singh/github-pr-concourse-resource/pkgs/container/github-pr-concourse-resource)
+[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io-2088FF?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/pkgs/container/github-pr-concourse-resource)
 
 A modern, feature-rich Concourse CI resource for GitHub Pull Requests with dual-mode support and GitHub App authentication.
 
