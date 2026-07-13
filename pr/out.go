@@ -43,18 +43,41 @@ func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (Ou
 
 	// Update commit status if requested
 	if request.Params.Status != "" {
-		context := request.Params.Context
-		if context == "" {
-			context = "concourse-ci"
+		baseContext := request.Params.BaseContext
+		if baseContext == "" {
+			baseContext = "concourse-ci"
+		}
+
+		statusContext := request.Params.Context
+		if statusContext == "" {
+			statusContext = "status"
 		}
 
 		description := request.Params.Description
-		if description == "" {
-			description = fmt.Sprintf("Build %s", request.Params.Status)
+
+		// Read description from file if specified
+		if request.Params.DescriptionFile != "" {
+			descriptionPath := filepath.Join(sourcesDir, request.Params.Path, request.Params.DescriptionFile)
+			descriptionBytes, err := os.ReadFile(descriptionPath)
+			if err != nil {
+				return OutResponse{}, fmt.Errorf("failed to read description file: %w", err)
+			}
+			description = string(descriptionBytes)
 		}
 
-		if err := github.UpdateCommitStatus(ctx, commit, request.Params.Status, request.Params.TargetURL, description, context); err != nil {
+		if description == "" {
+			description = fmt.Sprintf("Concourse CI build %s", request.Params.Status)
+		}
+
+		if err := github.UpdateCommitStatus(ctx, commit, request.Params.Status, safeExpandEnv(request.Params.TargetURL), description, baseContext, safeExpandEnv(statusContext)); err != nil {
 			return OutResponse{}, fmt.Errorf("failed to update commit status: %w", err)
+		}
+	}
+
+	// Delete previous comments if requested
+	if request.Params.DeletePreviousComments {
+		if err := github.DeletePreviousComments(ctx, prNumber); err != nil {
+			return OutResponse{}, fmt.Errorf("failed to delete previous comments: %w", err)
 		}
 	}
 
@@ -71,7 +94,7 @@ func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (Ou
 		}
 
 		if comment != "" {
-			if err := github.AddComment(ctx, prNumber, comment); err != nil {
+			if err := github.AddComment(ctx, prNumber, safeExpandEnv(comment)); err != nil {
 				return OutResponse{}, fmt.Errorf("failed to add comment: %w", err)
 			}
 		}
@@ -103,4 +126,15 @@ func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (Ou
 		Version:  version,
 		Metadata: metadata,
 	}, nil
+}
+
+// safeExpandEnv expands only Concourse build metadata environment variables
+func safeExpandEnv(s string) string {
+	return os.Expand(s, func(v string) string {
+		switch v {
+		case "BUILD_ID", "BUILD_NAME", "BUILD_JOB_NAME", "BUILD_PIPELINE_NAME", "BUILD_TEAM_NAME", "ATC_EXTERNAL_URL":
+			return os.Getenv(v)
+		}
+		return "$" + v
+	})
 }
