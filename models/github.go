@@ -3,6 +3,8 @@ package models
 import (
 	"context"
 	"fmt"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -218,14 +220,27 @@ func (gc *GithubClient) GetChangedFiles(ctx context.Context, number int) ([]stri
 }
 
 // UpdateCommitStatus updates the status of a commit
-func (gc *GithubClient) UpdateCommitStatus(ctx context.Context, sha, state, targetURL, description, context string) error {
+// If targetURL is empty, it automatically generates a Concourse build URL
+func (gc *GithubClient) UpdateCommitStatus(ctx context.Context, sha, state, targetURL, description, baseContext, statusContext string) error {
 	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	// Auto-generate build URL if not provided (matching telia-oss behavior)
+	if targetURL == "" {
+		atcURL := os.Getenv("ATC_EXTERNAL_URL")
+		buildID := os.Getenv("BUILD_ID")
+		if atcURL != "" && buildID != "" {
+			targetURL = strings.Join([]string{atcURL, "builds", buildID}, "/")
+		}
+	}
+
+	// Combine base context and status context (e.g., "concourse-ci/status")
+	fullContext := path.Join(baseContext, statusContext)
 
 	status := &github.RepoStatus{
 		State:       github.String(state),
 		TargetURL:   github.String(targetURL),
 		Description: github.String(description),
-		Context:     github.String(context),
+		Context:     github.String(fullContext),
 	}
 
 	_, _, err := gc.V3.Repositories.CreateStatus(ctx, owner, repo, sha, status)
@@ -247,6 +262,66 @@ func (gc *GithubClient) AddComment(ctx context.Context, number int, body string)
 	_, _, err := gc.V3.Issues.CreateComment(ctx, owner, repo, number, comment)
 	if err != nil {
 		return fmt.Errorf("failed to add comment: %w", err)
+	}
+
+	return nil
+}
+
+// DeletePreviousComments deletes all previous comments made by the current user on a PR
+func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int) error {
+	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	// Get the current authenticated user
+	var viewerQuery struct {
+		Viewer struct {
+			Login githubv4.String
+		}
+	}
+
+	if err := gc.V4.Query(ctx, &viewerQuery, nil); err != nil {
+		return fmt.Errorf("failed to get viewer: %w", err)
+	}
+
+	currentUserLogin := string(viewerQuery.Viewer.Login)
+
+	// Get all comments on the PR
+	var commentsQuery struct {
+		Repository struct {
+			PullRequest struct {
+				Comments struct {
+					Edges []struct {
+						Node struct {
+							DatabaseId githubv4.Int
+							Author     struct {
+								Login githubv4.String
+							}
+						}
+					}
+				} `graphql:"comments(last: $commentsLast)"`
+			} `graphql:"pullRequest(number: $prNumber)"`
+		} `graphql:"repository(owner: $repositoryOwner, name: $repositoryName)"`
+	}
+
+	variables := map[string]interface{}{
+		"repositoryOwner": githubv4.String(owner),
+		"repositoryName":  githubv4.String(repo),
+		"prNumber":        githubv4.Int(prNumber),
+		"commentsLast":    githubv4.Int(100),
+	}
+
+	if err := gc.V4.Query(ctx, &commentsQuery, variables); err != nil {
+		return fmt.Errorf("failed to query comments: %w", err)
+	}
+
+	// Delete comments made by the current user
+	for _, edge := range commentsQuery.Repository.PullRequest.Comments.Edges {
+		if string(edge.Node.Author.Login) == currentUserLogin {
+			commentID := int64(edge.Node.DatabaseId)
+			_, err := gc.V3.Issues.DeleteComment(ctx, owner, repo, commentID)
+			if err != nil {
+				return fmt.Errorf("failed to delete comment %d: %w", commentID, err)
+			}
+		}
 	}
 
 	return nil

@@ -61,14 +61,16 @@ type OutRequest struct {
 
 // OutParams contains parameters for the out operation
 type OutParams struct {
-	Path          string `json:"path"`
-	Status        string `json:"status"` // success, failure, error, pending
-	Context       string `json:"context"`
-	TargetURL     string `json:"target_url"`
-	Description   string `json:"description"`
-	Comment       string `json:"comment"`
-	CommentFile   string `json:"comment_file"`
-	DeleteComment string `json:"delete_previous_comments"`
+	Path                   string `json:"path"`
+	Status                 string `json:"status"` // success, failure, error, pending
+	BaseContext            string `json:"base_context"`
+	Context                string `json:"context"`
+	TargetURL              string `json:"target_url"`
+	Description            string `json:"description"`
+	DescriptionFile        string `json:"description_file"`
+	Comment                string `json:"comment"`
+	CommentFile            string `json:"comment_file"`
+	DeletePreviousComments bool   `json:"delete_previous_comments"`
 }
 
 // OutResponse represents the response for the out operation
