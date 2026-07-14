@@ -7,7 +7,7 @@ resource_types:
   - name: github-pr
     type: registry-image
     source:
-      repository: yourusername/github-pr-concourse-resource
+      repository: ujala-singh/github-pr-concourse-resource
       tag: latest
 
 resources:

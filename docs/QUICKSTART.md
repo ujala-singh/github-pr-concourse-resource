@@ -24,7 +24,7 @@ resource_types:
   - name: github-pr
     type: registry-image
     source:
-      repository: yourusername/github-pr-concourse-resource
+      repository: ujala-singh/github-pr-concourse-resource
       tag: latest
 ```
 
@@ -260,8 +260,8 @@ jobs:
 ## Getting Help
 
 - 📖 Read the full documentation in [README.md](README.md)
-- 🐛 Found a bug? [Open an issue](https://github.com/yourusername/github-pr-concourse-resource/issues)
-- 💬 Have questions? [Start a discussion](https://github.com/yourusername/github-pr-concourse-resource/discussions)
+- 🐛 Found a bug? [Open an issue](https://github.com/ujala-singh/github-pr-concourse-resource/issues)
+- 💬 Have questions? [Start a discussion](https://github.com/ujala-singh/github-pr-concourse-resource/discussions)
 
 ---
 

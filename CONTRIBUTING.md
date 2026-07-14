@@ -12,7 +12,7 @@ Thank you for your interest in contributing! This document provides guidelines a
 
 2. **Clone and Setup**
    ```bash
-   git clone https://github.com/yourusername/github-pr-concourse-resource.git
+   git clone https://github.com/ujala-singh/github-pr-concourse-resource.git
    cd github-pr-concourse-resource
    go mod download
    ```
