@@ -105,3 +105,34 @@ func TestCommonConfig_GetOwnerAndRepo(t *testing.T) {
 		t.Errorf("Expected repo to be 'myrepo', got '%s'", repo)
 	}
 }
+
+func TestPathMatches(t *testing.T) {
+	cases := []struct {
+		pattern string
+		file    string
+		want    bool
+	}{
+		// ** recursive glob
+		{"concourse-demo-setup/terraform/**", "concourse-demo-setup/terraform/US-EAST-1/EKS-Resources/main.tf", true},
+		{"concourse-demo-setup/terraform/**", "concourse-demo-setup/terraform/AZURE/networking/main.tf", true},
+		{"concourse-demo-setup/terraform/**", "concourse-demo-setup/helm/values.yaml", false},
+		{"**/*.tf", "a/b/c/main.tf", true},
+		{"**/*.tf", "main.tf", true},
+		{"**/*.tf", "main.yaml", false},
+		// single * does not cross path separators
+		{"src/*.go", "src/main.go", true},
+		{"src/*.go", "src/sub/main.go", false},
+		// plain prefix matching (no glob chars)
+		{"concourse-demo-setup/terraform", "concourse-demo-setup/terraform/US-EAST-1/main.tf", true},
+		{"concourse-demo-setup/terraform", "concourse-demo-setup/helm/values.yaml", false},
+		// exact match
+		{"Makefile", "Makefile", true},
+		{"Makefile", "src/Makefile", false},
+	}
+	for _, c := range cases {
+		got := pathMatches(c.pattern, c.file)
+		if got != c.want {
+			t.Errorf("pathMatches(%q, %q) = %v, want %v", c.pattern, c.file, got, c.want)
+		}
+	}
+}

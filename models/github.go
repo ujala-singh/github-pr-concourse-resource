@@ -414,6 +414,45 @@ func (gc *GithubClient) shouldSkipPR(pr *PullRequest) bool {
 	return false
 }
 
+// matchGlobPath reports whether a slash-separated file path matches a glob
+// pattern. Supports **, *, ?, and [] — where ** matches zero or more path
+// segments (e.g. "foo/**" matches "foo/bar/baz.tf").
+func matchGlobPath(pattern, file string) bool {
+	parts := strings.Split(pattern, "/")
+	segs := strings.Split(file, "/")
+	return matchGlobParts(parts, segs)
+}
+
+func matchGlobParts(pat, name []string) bool {
+	if len(pat) == 0 {
+		return len(name) == 0
+	}
+	if pat[0] == "**" {
+		// ** matches zero or more path segments.
+		for i := 0; i <= len(name); i++ {
+			if matchGlobParts(pat[1:], name[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(name) == 0 {
+		return false
+	}
+	// Delegate single-segment matching to filepath.Match for *, ?, [] support.
+	ok, _ := filepath.Match(pat[0], name[0])
+	return ok && matchGlobParts(pat[1:], name[1:])
+}
+
+// pathMatches reports whether file matches pattern, supporting both glob
+// patterns (with ** for recursive matching) and plain prefix matching.
+func pathMatches(pattern, file string) bool {
+	if strings.ContainsAny(pattern, "*?[") {
+		return matchGlobPath(pattern, file)
+	}
+	return strings.HasPrefix(file, pattern)
+}
+
 // MatchesPathFilters checks if the PR changes match the path filters
 func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest) (bool, error) {
 	// If no path filters, everything matches
@@ -426,27 +465,23 @@ func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest)
 		return false, err
 	}
 
-	// Check ignore paths first
+	// Check ignore paths first: a file is ignored if it matches any ignore pattern.
+	// A PR is included only when at least one changed file is not ignored.
 	if len(gc.Config.IgnorePaths) > 0 {
 		for _, file := range files {
 			ignored := false
 			for _, pattern := range gc.Config.IgnorePaths {
-				// Check if it's a prefix match
-				if strings.HasPrefix(file, pattern) {
-					ignored = true
-					break
-				}
-				// Check if it's a glob pattern
-				if matched, _ := filepath.Match(pattern, file); matched {
+				if pathMatches(pattern, file) {
 					ignored = true
 					break
 				}
 			}
 			if !ignored {
-				// Found at least one file that's not ignored
+				// At least one non-ignored file — proceed to include-path check.
 				if len(gc.Config.Paths) == 0 {
 					return true, nil
 				}
+				break
 			}
 		}
 	}
@@ -455,12 +490,7 @@ func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest)
 	if len(gc.Config.Paths) > 0 {
 		for _, file := range files {
 			for _, pattern := range gc.Config.Paths {
-				// Check if it's a prefix match
-				if strings.HasPrefix(file, pattern) {
-					return true, nil
-				}
-				// Check if it's a glob pattern
-				if matched, _ := filepath.Match(pattern, file); matched {
+				if pathMatches(pattern, file) {
 					return true, nil
 				}
 			}
