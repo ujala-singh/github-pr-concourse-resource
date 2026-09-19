@@ -32,6 +32,11 @@ type CommonConfig struct {
 	BaseBranch              string   `json:"base_branch"`
 	Labels                  []string `json:"labels"`
 	States                  []string `json:"states"`
+	// ConcourseURL overrides ATC_EXTERNAL_URL when constructing PR status check target
+	// URLs. Use when Concourse's externalUrl Helm value cannot be changed (e.g. it is
+	// locked to an STS WebIdentity OIDC issuer) but builds are reached via a different
+	// public hostname (e.g. a Teleport proxy).
+	ConcourseURL string `json:"concourse_url"`
 }
 
 // GithubConfig contains GitHub-specific configuration
