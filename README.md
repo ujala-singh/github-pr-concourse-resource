@@ -225,6 +225,7 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `base_branch` | No | - | Only trigger on PRs targeting this branch |
 | `labels` | No | `[]` | Only trigger on PRs with at least one of these labels |
 | `states` | No | `["OPEN"]` | PR states to track: `OPEN`, `MERGED`, `CLOSED` |
+| `concourse_url` | No | - | Override the public URL used for PR status check "Details" links. Useful when Concourse's `externalUrl` Helm value is locked to a different hostname (e.g. an STS WebIdentity OIDC issuer) but builds are reached via a proxy or alternate domain. When set, this value replaces `ATC_EXTERNAL_URL` for the `put` step. |
 
 > **Note:** Either `access_token` OR all three GitHub App parameters (`github_app_id`, `github_app_installation_id`, `github_app_private_key`) must be provided.
 

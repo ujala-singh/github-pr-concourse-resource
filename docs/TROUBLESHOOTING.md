@@ -410,6 +410,34 @@ resource check duration: 2m30s
        status: failure
    ```
 
+### Problem: Status Check "Details" Link Points to Wrong Hostname
+
+**Symptoms:**
+
+The link attached to a GitHub commit status check opens a URL on the wrong host — for example, `concourse.example.com` instead of `concourse.proxy.example.com` — resulting in an access-denied or unreachable page.
+
+**Cause:**
+
+Concourse injects `ATC_EXTERNAL_URL` into every build from its `externalUrl` Helm value. This value may be locked to a hostname that differs from the one users actually reach builds through (e.g. when `externalUrl` is tied to an STS WebIdentity OIDC issuer, or when builds are accessed via a Teleport proxy under a different domain).
+
+**Solution:**
+
+Set `concourse_url` in the resource source to the public URL users should be sent to:
+
+```yaml
+resources:
+  - name: pull-request
+    type: github-pr
+    source:
+      repository: owner/repo
+      github_app_id: ((github-app-id))
+      github_app_installation_id: ((github-app-installation-id))
+      github_app_private_key: ((github-app-private-key))
+      concourse_url: "https://concourse.proxy.example.com"
+```
+
+`concourse_url` overrides `ATC_EXTERNAL_URL` at the start of the `put` step, so both explicit `target_url` expansions and the auto-generated build URL (`$ATC_EXTERNAL_URL/builds/$BUILD_ID`) use the correct hostname.
+
 ### Problem: Comments Not Appearing
 
 **Solutions:**
