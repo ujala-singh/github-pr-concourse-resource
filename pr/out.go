@@ -15,6 +15,14 @@ import (
 func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (OutResponse, error) {
 	ctx := context.Background()
 
+	// Allow the pipeline to supply a Teleport / proxy hostname that differs from
+	// Concourse's locked externalUrl (which may be bound to an STS OIDC issuer).
+	// Overriding ATC_EXTERNAL_URL here affects both safeExpandEnv and the
+	// auto-generated build URL in UpdateCommitStatus.
+	if request.Source.ConcourseURL != "" {
+		os.Setenv("ATC_EXTERNAL_URL", request.Source.ConcourseURL)
+	}
+
 	// Read metadata from the source path
 	resourcePath := filepath.Join(sourcesDir, request.Params.Path, ".git", "resource")
 
