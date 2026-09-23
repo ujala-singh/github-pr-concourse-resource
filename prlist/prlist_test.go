@@ -281,10 +281,10 @@ func newTestPathFilterGithubClient(t *testing.T, paths []string, filesByPR map[i
 		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", number), func(w http.ResponseWriter, r *http.Request) {
 			if errPRs[number] {
 				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprint(w, `{"message": "boom"}`)
+				_, _ = fmt.Fprint(w, `{"message": "boom"}`)
 				return
 			}
-			fmt.Fprint(w, files)
+			_, _ = fmt.Fprint(w, files)
 		})
 	}
 
@@ -368,7 +368,7 @@ func TestFilterPRsByPath_PropagatesErrorFromAnyWorker(t *testing.T) {
 func TestApplyCommentTriggers_FirstObservation_EstablishesBaselineWithoutFiring(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"id": 555, "body": "concourse plan"}]`)
+		_, _ = fmt.Fprint(w, `[{"id": 555, "body": "concourse plan"}]`)
 	})
 	gc := newTestGithubClient(t, mux)
 
@@ -390,7 +390,7 @@ func TestApplyCommentTriggers_FirstObservation_EstablishesBaselineWithoutFiring(
 func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"id": 100, "body": "concourse plan"}, {"id": 555, "body": "concourse plan"}]`)
+		_, _ = fmt.Fprint(w, `[{"id": 100, "body": "concourse plan"}, {"id": 555, "body": "concourse plan"}]`)
 	})
 	gc := newTestGithubClient(t, mux)
 
@@ -419,7 +419,7 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `[{"id": 555, "body": "concourse plan"}]`)
+		_, _ = fmt.Fprint(w, `[{"id": 555, "body": "concourse plan"}]`)
 	})
 	gc := newTestGithubClient(t, mux)
 
@@ -472,7 +472,7 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		// cursorPR has an established baseline (see request.Version below),
 		// so only cursorPR should actually fire.
 		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", number), func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, `[{"id": 100, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, 1000+number)
+			_, _ = fmt.Fprintf(w, `[{"id": 100, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, 1000+number)
 		})
 	}
 

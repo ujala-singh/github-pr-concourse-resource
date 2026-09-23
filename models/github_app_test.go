@@ -128,7 +128,7 @@ func TestGetInstallationToken(t *testing.T) {
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
+			_, _ = fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
 		}))
 		defer server.Close()
 
@@ -352,7 +352,7 @@ func TestGithubClient_GetAccessToken(t *testing.T) {
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
+			_, _ = fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
 		}))
 		defer server.Close()
 
