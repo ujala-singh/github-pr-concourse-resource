@@ -40,7 +40,12 @@ type CommonConfig struct {
 	// TriggerComments lists comment prefixes (case-insensitive) that re-trigger the
 	// pipeline job as if a new commit had arrived. Useful for manually re-running
 	// plans via a PR comment such as "concourse plan --all".
-	// Only applies to single-PR mode (pr package). Ignored by prlist.
+	//
+	// Supported in both single-PR mode (pr package) and PR-list mode (prlist
+	// package). In list mode this is best-effort: the resource's version
+	// stream only tracks a single cursor across many PRs, so once the cursor
+	// moves on to a different PR, that PR's comment watermark is lost until
+	// it's re-established — see prlist.applyCommentTriggers.
 	TriggerComments []string `json:"trigger_comments"`
 }
 
