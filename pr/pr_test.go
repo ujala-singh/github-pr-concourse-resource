@@ -313,3 +313,85 @@ func TestOutRequest_Validate(t *testing.T) {
 		})
 	}
 }
+
+func TestTriggerComments_SourceField(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  Source
+		wantLen int
+	}{
+		{
+			name: "no trigger comments",
+			source: Source{
+				CommonConfig: models.CommonConfig{
+					Repository:  "owner/repo",
+					AccessToken: "token",
+				},
+				Number: 42,
+			},
+			wantLen: 0,
+		},
+		{
+			name: "single trigger comment",
+			source: Source{
+				CommonConfig: models.CommonConfig{
+					Repository:      "owner/repo",
+					AccessToken:     "token",
+					TriggerComments: []string{"concourse plan"},
+				},
+				Number: 42,
+			},
+			wantLen: 1,
+		},
+		{
+			name: "multiple trigger comments",
+			source: Source{
+				CommonConfig: models.CommonConfig{
+					Repository:      "owner/repo",
+					AccessToken:     "token",
+					TriggerComments: []string{"concourse plan", "concourse apply"},
+				},
+				Number: 42,
+			},
+			wantLen: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.source.Validate(); err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+			if len(tt.source.TriggerComments) != tt.wantLen {
+				t.Errorf("TriggerComments len = %d, want %d", len(tt.source.TriggerComments), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestVersion_CommentID(t *testing.T) {
+	tests := []struct {
+		name    string
+		version models.Version
+		wantID  int64
+	}{
+		{
+			name:    "commit-only version has zero CommentID",
+			version: models.Version{PR: "42", Commit: "abc123"},
+			wantID:  0,
+		},
+		{
+			name:    "comment-triggered version carries CommentID",
+			version: models.Version{PR: "42", Commit: "abc123", CommentID: 9876543},
+			wantID:  9876543,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.version.CommentID != tt.wantID {
+				t.Errorf("CommentID = %d, want %d", tt.version.CommentID, tt.wantID)
+			}
+		})
+	}
+}

@@ -37,6 +37,11 @@ type CommonConfig struct {
 	// locked to an STS WebIdentity OIDC issuer) but builds are reached via a different
 	// public hostname (e.g. a Teleport proxy).
 	ConcourseURL string `json:"concourse_url"`
+	// TriggerComments lists comment prefixes (case-insensitive) that re-trigger the
+	// pipeline job as if a new commit had arrived. Useful for manually re-running
+	// plans via a PR comment such as "concourse plan --all".
+	// Only applies to single-PR mode (pr package). Ignored by prlist.
+	TriggerComments []string `json:"trigger_comments"`
 }
 
 // GithubConfig contains GitHub-specific configuration
@@ -207,6 +212,10 @@ type Version struct {
 	Commit              string `json:"commit,omitempty"`
 	CommittedDate       string `json:"committed,omitempty"`
 	ApprovedReviewCount int    `json:"approved_review_count,omitempty"`
+	// CommentID is the GitHub comment ID that last triggered a plan via
+	// trigger_comments. It acts as a watermark so the same comment never
+	// triggers more than one build. Zero means no comment trigger has fired yet.
+	CommentID int64 `json:"comment_id,omitempty"`
 }
 
 // Metadata represents resource metadata
