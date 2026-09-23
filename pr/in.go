@@ -266,7 +266,7 @@ func writeMetadataFiles(destDir string, metadata []models.Metadata, version mode
 		if i > 0 {
 			metadataJSON.WriteString(",")
 		}
-		metadataJSON.WriteString(fmt.Sprintf(`{"name":"%s","value":"%s"}`, m.Name, m.Value))
+		fmt.Fprintf(&metadataJSON, `{"name":"%s","value":"%s"}`, m.Name, m.Value)
 	}
 	metadataJSON.WriteString("]")
 	if err := os.WriteFile(metadataPath, []byte(metadataJSON.String()), 0644); err != nil {

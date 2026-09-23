@@ -20,7 +20,9 @@ func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (Ou
 	// Overriding ATC_EXTERNAL_URL here affects both safeExpandEnv and the
 	// auto-generated build URL in UpdateCommitStatus.
 	if request.Source.ConcourseURL != "" {
-		os.Setenv("ATC_EXTERNAL_URL", request.Source.ConcourseURL)
+		if err := os.Setenv("ATC_EXTERNAL_URL", request.Source.ConcourseURL); err != nil {
+			return OutResponse{}, fmt.Errorf("failed to set ATC_EXTERNAL_URL: %w", err)
+		}
 	}
 
 	// Read metadata from the source path
