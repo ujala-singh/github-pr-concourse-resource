@@ -5,7 +5,7 @@ Thank you for your interest in contributing! This document provides guidelines a
 ## Development Setup
 
 1. **Prerequisites**
-   - Go 1.23 or higher
+   - Go 1.26 or higher
    - Docker 24.0 or higher (for building images)
    - [Task](https://taskfile.dev/) (optional, for using Taskfile)
    - [golangci-lint](https://golangci-lint.run/) (for code linting)

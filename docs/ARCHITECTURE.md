@@ -104,12 +104,15 @@
           ==================
 
 Check (prlist):
-  User Config → prlist.Check() → models.GetPullRequests() 
-    → GitHub GraphQL → Filter PRs → Return Versions
+  User Config → prlist.Check() → models.GetPullRequests()
+    → GitHub GraphQL → Filter PRs by path (concurrent, bounded pool)
+    → [if trigger_comments set] scan each matching PR's comments
+      (concurrent, bounded pool) → Return Versions
 
 Check (pr):
   User Config → pr.Check() → models.GetPullRequestCommits()
-    → GitHub REST → Filter Commits → Return Versions
+    → GitHub REST → Filter Commits
+    → [if trigger_comments set] scan this PR's comments → Return Versions
 
 In (prlist):
   Version → prlist.In() → models.GetPullRequest()
