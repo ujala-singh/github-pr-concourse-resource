@@ -77,7 +77,7 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           build-args: |
-            GO_VERSION=1.23
+            GO_VERSION=1.26
             
       - name: Generate build provenance attestation
         uses: actions/attest-build-provenance@v4
