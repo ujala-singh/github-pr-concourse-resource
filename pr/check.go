@@ -64,28 +64,33 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	// A match newer than the last known CommentID fires an extra version,
 	// causing the plan job to re-run exactly as if a new commit had arrived.
 	if len(request.Source.TriggerComments) > 0 {
-		// firstCheck = true when: (a) first run overall, or (b) the stored
-		// version predates trigger_comments support (CommentID == 0). In both
-		// cases we establish a watermark without firing a build.
-		firstCheck := firstRun || request.Version.CommentID == 0
+		// baselineEstablished = true once a previous check has already
+		// recorded the comment-trigger watermark (CommentBaseline), which
+		// happens on every check including the very first. Falling back to
+		// "CommentID == 0" here would be ambiguous: 0 is also the correct,
+		// legitimate watermark when no matching comment has been posted yet,
+		// so the first real trigger comment would be silently swallowed as
+		// if it were establishing the baseline instead of firing a build.
+		baselineEstablished := !firstRun && request.Version.CommentBaseline
 		var sinceCommentID int64
-		if !firstCheck {
+		if baselineEstablished {
 			sinceCommentID = request.Version.CommentID
 		}
 
 		latestMatchID, triggered, err := github.CheckTriggerComments(
-			ctx, request.Source.Number, request.Source.TriggerComments,
-			sinceCommentID, firstCheck,
+			ctx, request.Source.Number, request.Source.TriggerComments, sinceCommentID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check trigger comments: %w", err)
 		}
+		if !baselineEstablished {
+			triggered = false
+		}
 
 		// Stamp the watermark on all versions so future checks don't re-trigger.
 		for i := range versions {
-			if latestMatchID > versions[i].CommentID {
-				versions[i].CommentID = latestMatchID
-			}
+			versions[i].CommentID = latestMatchID
+			versions[i].CommentBaseline = true
 		}
 
 		if triggered {
@@ -101,6 +106,7 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 				CommittedDate:       pr.CommittedDate,
 				ApprovedReviewCount: pr.ApprovedReviewCount,
 				CommentID:           latestMatchID,
+				CommentBaseline:     true,
 			})
 		}
 	}

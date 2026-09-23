@@ -212,10 +212,16 @@ type Version struct {
 	Commit              string `json:"commit,omitempty"`
 	CommittedDate       string `json:"committed,omitempty"`
 	ApprovedReviewCount int    `json:"approved_review_count,omitempty"`
-	// CommentID is the GitHub comment ID that last triggered a plan via
-	// trigger_comments. It acts as a watermark so the same comment never
-	// triggers more than one build. Zero means no comment trigger has fired yet.
+	// CommentID is the highest trigger-comment ID observed on the PR as of
+	// this version. It acts as a watermark so the same comment never
+	// triggers more than one build. Zero is a legitimate value (no matching
+	// comment has been posted yet) — use CommentBaseline to tell that apart
+	// from "the comment-trigger check has never run for this resource".
 	CommentID int64 `json:"comment_id,omitempty"`
+	// CommentBaseline is true once the comment-trigger watermark above has
+	// been established at least once. Until then, CommentID == 0 is
+	// ambiguous (never checked vs. checked-and-found-nothing).
+	CommentBaseline bool `json:"comment_baseline,omitempty"`
 }
 
 // Metadata represents resource metadata
