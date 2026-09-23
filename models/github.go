@@ -327,6 +327,58 @@ func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int
 	return nil
 }
 
+// CheckTriggerComments scans PR comments for any that match the given prefixes
+// (case-insensitive). It returns the ID of the latest matching comment and
+// whether that comment is newer than sinceID (i.e., a new trigger has arrived).
+//
+// On the first check for a resource (firstCheck = true) this function records
+// the watermark without signalling a trigger, so existing comments do not
+// retroactively fire a build when trigger_comments is first added to the source.
+func (gc *GithubClient) CheckTriggerComments(ctx context.Context, prNumber int, patterns []string, sinceID int64, firstCheck bool) (latestMatchID int64, triggered bool, err error) {
+	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+
+	for {
+		comments, resp, err := gc.V3.Issues.ListComments(ctx, owner, repo, prNumber, opts)
+		if err != nil {
+			return 0, false, fmt.Errorf("failed to list PR comments: %w", err)
+		}
+
+		for _, c := range comments {
+			id := c.GetID()
+			body := strings.TrimSpace(c.GetBody())
+			for _, pattern := range patterns {
+				if strings.HasPrefix(strings.ToLower(body), strings.ToLower(strings.TrimSpace(pattern))) {
+					if id > latestMatchID {
+						latestMatchID = id
+					}
+					break
+				}
+			}
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	if latestMatchID == 0 {
+		// No matching comments on this PR at all.
+		return 0, false, nil
+	}
+
+	if firstCheck {
+		// Establish watermark without triggering.
+		return latestMatchID, false, nil
+	}
+
+	return latestMatchID, latestMatchID > sinceID, nil
+}
+
 // Helper functions
 
 func (gc *GithubClient) convertPRNode(node prNode) *PullRequest {
