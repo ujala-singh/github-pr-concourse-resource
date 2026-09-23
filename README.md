@@ -2,7 +2,7 @@
 
 [![CI Status](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/ci.yml/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/ci.yml)
 [![Publish to GHCR](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/publish-ghcr.yml/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/publish-ghcr.yml)
-[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io-2088FF?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/pkgs/container/github-pr-concourse-resource)
 [![Attestations](https://img.shields.io/badge/Attestations-SLSA%20Provenance-green?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/attestations)
@@ -68,7 +68,7 @@ resource_types:
 ### Option 3: Building from Source
 
 **Requirements:**
-- Go 1.23 or higher
+- Go 1.26 or higher
 - Docker (for containerization)
 
 ```bash
@@ -129,7 +129,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: pull-requests
           run:
@@ -226,6 +226,7 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `labels` | No | `[]` | Only trigger on PRs with at least one of these labels |
 | `states` | No | `["OPEN"]` | PR states to track: `OPEN`, `MERGED`, `CLOSED` |
 | `concourse_url` | No | - | Override the public URL used for PR status check "Details" links. Useful when Concourse's `externalUrl` Helm value is locked to a different hostname (e.g. an STS WebIdentity OIDC issuer) but builds are reached via a proxy or alternate domain. When set, this value replaces `ATC_EXTERNAL_URL` for the `put` step. |
+| `trigger_comments` | No | `[]` | Comment prefixes (case-insensitive) that re-trigger the job as if a new commit had arrived, without pushing one. E.g. `["concourse plan"]` lets a PR comment of "concourse plan" (or "concourse plan --all", etc.) re-run the job against the PR's current HEAD. See [Comment Triggers](#comment-triggers) below. |
 
 > **Note:** Either `access_token` OR all three GitHub App parameters (`github_app_id`, `github_app_installation_id`, `github_app_private_key`) must be provided.
 
@@ -243,6 +244,25 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `required_review_approvals` | No | `0` | Minimum number of approved reviews required |
 | `git_crypt_key` | No | - | Base64 encoded git-crypt key for encrypted repositories |
 | `disable_git_lfs` | No | `false` | Disable Git LFS |
+
+### Comment Triggers
+
+Set `trigger_comments` to re-run a job from a PR comment instead of a new commit — handy for re-running a `plan` after an unrelated failure, without pushing an empty commit:
+
+```yaml
+source:
+  repository: owner/repo
+  access_token: ((github-token))
+  trigger_comments:
+    - "concourse plan"
+```
+
+Commenting `concourse plan` (case-insensitive, prefix match) on the PR causes the next `check` to emit a new version for that PR's **current HEAD** — not the commit that existed when the comment was posted. This works the same way in both modes, with one difference:
+
+- **Single PR mode** (`number` set): fully reliable. Every check tracks that one PR's comment watermark exactly.
+- **PR list mode** (`number` unset): best-effort. The resource's version stream only remembers a single cursor across every matching PR, not a per-PR history. Once the cursor moves on to a different PR (e.g. because another PR got a new commit), the PR you commented on loses its watermark — the *next* comment on it re-establishes a fresh baseline rather than firing immediately. This is reliable when you're only actively working one PR at a time, but can occasionally miss (or, rarely, double-fire) a trigger under heavy concurrent PR activity across many matching PRs.
+
+In both modes, the very first `trigger_comments`-eligible check for a PR (or the first check after upgrading to a version of this resource that supports it) only establishes the watermark — it won't retroactively fire on comments that already existed before the pipeline started watching for them.
 
 ## Behavior
 
@@ -444,7 +464,7 @@ jobs:
 ### Building Locally
 
 **Requirements:**
-- Go 1.23 or higher
+- Go 1.26 or higher
 - Docker 24.0 or higher
 - Git 2.40 or higher
 

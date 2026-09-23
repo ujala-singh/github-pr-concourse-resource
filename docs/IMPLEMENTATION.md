@@ -59,7 +59,7 @@ github-pr-concourse-resource/
 ✅ Enhanced security checks
 
 ### Modern Stack
-✅ Go 1.23+
+✅ Go 1.26+
 ✅ Latest GitHub API libraries (go-github v60)
 ✅ Cleaner separation of concerns
 ✅ Better error handling

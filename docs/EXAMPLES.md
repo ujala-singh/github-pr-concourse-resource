@@ -11,6 +11,7 @@ Comprehensive examples for common CI/CD scenarios.
 - [Advanced Filtering](#advanced-filtering)
 - [Integration Examples](#integration-examples)
 - [Security Patterns](#security-patterns)
+- [Comment-Triggered Runs](#comment-triggered-runs)
 
 ## PR List Mode Examples
 
@@ -45,7 +46,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23-alpine"}
+            source: {repository: golang, tag: "1.26-alpine"}
           inputs:
             - name: pull-requests
           run:
@@ -212,7 +213,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: feature-pr
           run:
@@ -269,7 +270,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: my-pr
           run:
@@ -282,7 +283,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: my-pr
           run:
@@ -445,7 +446,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: auto-merge-prs
           run:
@@ -499,7 +500,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: my-pr
           run:
@@ -606,6 +607,51 @@ jobs:
                   exit 1
                 fi
 ```
+
+## Comment-Triggered Runs
+
+### Example 14: Re-run a Terraform Plan from a PR Comment
+
+Use `trigger_comments` to re-run a job from a PR comment (e.g. `concourse plan`) instead of requiring a new commit — useful for re-running a plan after an unrelated infra failure, or after approving/merging a base branch change that should be re-planned against.
+
+```yaml
+resources:
+  - name: pull-request
+    type: github-pr
+    source:
+      repository: owner/repo
+      github_app_id: ((github-app-id))
+      github_app_installation_id: ((github-app-installation-id))
+      github_app_private_key: ((github-app-private-key))
+      paths:
+        - terraform/**
+      trigger_comments:
+        - "concourse plan"
+
+jobs:
+  - name: pr-plan
+    plan:
+      - get: pull-request
+        trigger: true
+      - task: terraform-plan
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: hashicorp/terraform, tag: "latest"}
+          inputs:
+            - name: pull-request
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                cd pull-request/terraform
+                terraform init
+                terraform plan
+```
+
+Commenting `concourse plan` on the PR causes the next check to pick up a new version for the PR's current HEAD, re-running `pr-plan` without a new commit. See [Comment Triggers](../README.md#comment-triggers) in the README for the single-PR-vs-list-mode reliability tradeoff.
 
 ## Best Practices
 

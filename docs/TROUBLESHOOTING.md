@@ -284,7 +284,7 @@ ERROR: failed to rebase: merge conflicts detected
      type: registry-image
      source:
        repository: golang
-       tag: "1.23"  # Match your local version
+       tag: "1.26"  # Match your local version
    ```
 
 2. **Missing dependencies**:
