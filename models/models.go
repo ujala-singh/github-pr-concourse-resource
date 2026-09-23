@@ -3,9 +3,11 @@ package models
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/google/go-github/v60/github"
@@ -211,22 +213,87 @@ func (c *GithubClient) GetAccessToken(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("no authentication method configured")
 }
 
-// Version represents a resource version
+// Version represents a resource version.
+//
+// Concourse's resource protocol requires every version to be a flat JSON
+// object of STRING values (ATC decodes it as map[string]string). A field
+// that serializes as a native bool or number — e.g. a populated
+// ApprovedReviewCount, CommentID, or CommentBaseline — makes ATC fail check
+// entirely with "json: cannot unmarshal <type> into Go value of type
+// string". MarshalJSON/UnmarshalJSON below encode/decode every field
+// through its string form so this struct can use normal Go types
+// internally while staying protocol-compliant on the wire.
 type Version struct {
 	PR                  string `json:"pr"`
 	Commit              string `json:"commit,omitempty"`
 	CommittedDate       string `json:"committed,omitempty"`
-	ApprovedReviewCount int    `json:"approved_review_count,omitempty"`
+	ApprovedReviewCount int    `json:"-"`
 	// CommentID is the highest trigger-comment ID observed on the PR as of
 	// this version. It acts as a watermark so the same comment never
 	// triggers more than one build. Zero is a legitimate value (no matching
 	// comment has been posted yet) — use CommentBaseline to tell that apart
 	// from "the comment-trigger check has never run for this resource".
-	CommentID int64 `json:"comment_id,omitempty"`
+	CommentID int64 `json:"-"`
 	// CommentBaseline is true once the comment-trigger watermark above has
 	// been established at least once. Until then, CommentID == 0 is
 	// ambiguous (never checked vs. checked-and-found-nothing).
-	CommentBaseline bool `json:"comment_baseline,omitempty"`
+	CommentBaseline bool `json:"-"`
+}
+
+// MarshalJSON encodes the version as map[string]string, as required by the
+// Concourse resource protocol.
+func (v Version) MarshalJSON() ([]byte, error) {
+	m := map[string]string{
+		"pr": v.PR,
+	}
+	if v.Commit != "" {
+		m["commit"] = v.Commit
+	}
+	if v.CommittedDate != "" {
+		m["committed"] = v.CommittedDate
+	}
+	if v.ApprovedReviewCount != 0 {
+		m["approved_review_count"] = strconv.Itoa(v.ApprovedReviewCount)
+	}
+	if v.CommentID != 0 {
+		m["comment_id"] = strconv.FormatInt(v.CommentID, 10)
+	}
+	if v.CommentBaseline {
+		m["comment_baseline"] = "true"
+	}
+	return json.Marshal(m)
+}
+
+// UnmarshalJSON decodes a version from its map[string]string wire form back
+// into native Go types.
+func (v *Version) UnmarshalJSON(data []byte) error {
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+
+	v.PR = m["pr"]
+	v.Commit = m["commit"]
+	v.CommittedDate = m["committed"]
+	v.CommentBaseline = m["comment_baseline"] == "true"
+
+	if s, ok := m["approved_review_count"]; ok && s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return fmt.Errorf("invalid approved_review_count %q: %w", s, err)
+		}
+		v.ApprovedReviewCount = n
+	}
+
+	if s, ok := m["comment_id"]; ok && s != "" {
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid comment_id %q: %w", s, err)
+		}
+		v.CommentID = n
+	}
+
+	return nil
 }
 
 // Metadata represents resource metadata
