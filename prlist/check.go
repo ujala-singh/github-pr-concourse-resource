@@ -51,6 +51,71 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 		versions = []models.Version{*request.Version}
 	}
 
+	if len(request.Source.TriggerComments) > 0 {
+		var err error
+		versions, err = applyCommentTriggers(ctx, request, github, filteredPRs, versions)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return versions, nil
+}
+
+// applyCommentTriggers scans every currently path-matching PR for a comment
+// matching source.trigger_comments and appends an extra version for any PR
+// whose latest matching comment is new since this resource last observed
+// that specific PR.
+//
+// Caveat: unlike single-PR mode, this resource's version stream only
+// remembers a single cursor — the one version Concourse hands back as
+// request.Version — not a per-PR history. Once the cursor advances past a
+// given PR (e.g. because a different PR got a new commit), that PR's
+// comment watermark is lost. A later comment on it is then treated as
+// establishing a fresh baseline (no trigger) rather than firing
+// immediately. This is best-effort: reliable when at most one PR is being
+// actively worked on at a time, but can miss (or, rarely, double-fire) a
+// trigger under heavy concurrent PR churn across many matching PRs.
+func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, filteredPRs []*models.PullRequest, versions []models.Version) ([]models.Version, error) {
+	for _, pr := range filteredPRs {
+		prKey := strconv.Itoa(pr.Number)
+
+		baselineEstablished := request.Version != nil && request.Version.PR == prKey && request.Version.CommentBaseline
+		var sinceID int64
+		if baselineEstablished {
+			sinceID = request.Version.CommentID
+		}
+
+		latestMatchID, triggered, err := github.CheckTriggerComments(ctx, pr.Number, request.Source.TriggerComments, sinceID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check trigger comments for PR #%d: %w", pr.Number, err)
+		}
+		if !baselineEstablished {
+			triggered = false
+		}
+
+		// Stamp the watermark on any version already in this batch for this
+		// PR, so the cursor — if it lands here — carries the up-to-date
+		// CommentID forward.
+		for i := range versions {
+			if versions[i].PR == prKey {
+				versions[i].CommentID = latestMatchID
+				versions[i].CommentBaseline = true
+			}
+		}
+
+		if triggered {
+			versions = append(versions, models.Version{
+				PR:                  prKey,
+				Commit:              pr.HeadRefOID,
+				CommittedDate:       pr.CommittedDate,
+				ApprovedReviewCount: pr.ApprovedReviewCount,
+				CommentID:           latestMatchID,
+				CommentBaseline:     true,
+			})
+		}
+	}
+
 	return versions, nil
 }
 
