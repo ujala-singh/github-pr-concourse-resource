@@ -328,13 +328,12 @@ func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int
 }
 
 // CheckTriggerComments scans PR comments for any that match the given prefixes
-// (case-insensitive). It returns the ID of the latest matching comment and
-// whether that comment is newer than sinceID (i.e., a new trigger has arrived).
-//
-// On the first check for a resource (firstCheck = true) this function records
-// the watermark without signalling a trigger, so existing comments do not
-// retroactively fire a build when trigger_comments is first added to the source.
-func (gc *GithubClient) CheckTriggerComments(ctx context.Context, prNumber int, patterns []string, sinceID int64, firstCheck bool) (latestMatchID int64, triggered bool, err error) {
+// (case-insensitive). It returns the ID of the latest matching comment (0 if
+// none match) and whether that comment is newer than sinceID (i.e. a new
+// trigger has arrived). Callers are responsible for suppressing the trigger
+// on the first-ever check for a resource (see pr.Check), since sinceID alone
+// cannot distinguish "no baseline yet" from "baseline is legitimately zero".
+func (gc *GithubClient) CheckTriggerComments(ctx context.Context, prNumber int, patterns []string, sinceID int64) (latestMatchID int64, triggered bool, err error) {
 	owner, repo := gc.Config.GetOwnerAndRepo()
 
 	opts := &github.IssueListCommentsOptions{
@@ -369,11 +368,6 @@ func (gc *GithubClient) CheckTriggerComments(ctx context.Context, prNumber int, 
 	if latestMatchID == 0 {
 		// No matching comments on this PR at all.
 		return 0, false, nil
-	}
-
-	if firstCheck {
-		// Establish watermark without triggering.
-		return latestMatchID, false, nil
 	}
 
 	return latestMatchID, latestMatchID > sinceID, nil

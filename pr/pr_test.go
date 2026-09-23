@@ -395,3 +395,32 @@ func TestVersion_CommentID(t *testing.T) {
 		})
 	}
 }
+
+// TestVersion_CommentBaseline guards against regressing to using CommentID's
+// zero value as a stand-in for "the comment-trigger watermark was never
+// established". A version stamped after establishing the baseline with no
+// matching comments yet must be distinguishable from a version that predates
+// trigger_comments support entirely (both have CommentID == 0), otherwise
+// the first real trigger comment posted on a PR gets silently swallowed as
+// if it were still establishing the baseline instead of firing a build.
+func TestVersion_CommentBaseline(t *testing.T) {
+	preFeatureVersion := models.Version{PR: "42", Commit: "abc123"}
+	if preFeatureVersion.CommentBaseline {
+		t.Fatalf("version predating trigger_comments support must decode with CommentBaseline = false")
+	}
+	if preFeatureVersion.CommentID != 0 {
+		t.Fatalf("version predating trigger_comments support must have CommentID = 0")
+	}
+
+	establishedNoMatch := models.Version{PR: "42", Commit: "abc123", CommentBaseline: true}
+	if establishedNoMatch.CommentID != 0 {
+		t.Fatalf("expected CommentID = 0 for an established baseline with no matching comments yet")
+	}
+	if !establishedNoMatch.CommentBaseline {
+		t.Fatalf("expected CommentBaseline = true once the watermark has been established")
+	}
+
+	if preFeatureVersion.CommentID == establishedNoMatch.CommentID && preFeatureVersion.CommentBaseline == establishedNoMatch.CommentBaseline {
+		t.Fatalf("pre-feature and established-with-no-match versions must be distinguishable via CommentBaseline")
+	}
+}
