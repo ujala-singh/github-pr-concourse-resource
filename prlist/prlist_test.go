@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v60/github"
+	"github.com/shurcooL/githubv4"
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
 
@@ -58,53 +59,6 @@ func TestSource_Validate(t *testing.T) {
 			err := tt.source.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Source.Validate() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestFilterNewVersions(t *testing.T) {
-	tests := []struct {
-		name        string
-		versions    []models.Version
-		lastVersion models.Version
-		want        int // expected count
-	}{
-		{
-			name: "no new versions",
-			versions: []models.Version{
-				{PR: "1"},
-				{PR: "2"},
-			},
-			lastVersion: models.Version{PR: "2"},
-			want:        0,
-		},
-		{
-			name: "has new versions",
-			versions: []models.Version{
-				{PR: "1"},
-				{PR: "2"},
-				{PR: "3"},
-			},
-			lastVersion: models.Version{PR: "1"},
-			want:        2,
-		},
-		{
-			name: "last version not found",
-			versions: []models.Version{
-				{PR: "1"},
-				{PR: "2"},
-			},
-			lastVersion: models.Version{PR: "99"},
-			want:        2,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := filterNewVersions(tt.versions, tt.lastVersion)
-			if len(result) != tt.want {
-				t.Errorf("filterNewVersions() returned %d versions, want %d", len(result), tt.want)
 			}
 		})
 	}
@@ -311,8 +265,9 @@ func newTestPathFilterGithubClient(t *testing.T, paths []string, filesByPR map[i
 // TestFilterPRsByPath_PreservesInputOrder runs many PRs concurrently through
 // filterPRsByPath and verifies the matching subset comes back in the exact
 // same relative order as the input, even though goroutines finish out of
-// order. This matters because downstream cursor-based version diffing
-// (filterNewVersions) assumes a stable, deterministic ordering.
+// order. This matters because Check's output order should be a stable,
+// deterministic function of GetPullRequests' order, not of goroutine
+// scheduling.
 func TestFilterPRsByPath_PreservesInputOrder(t *testing.T) {
 	filesByPR := map[int]string{
 		1: `[{"filename": "terraform/a.tf"}]`,
@@ -528,5 +483,77 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 	}
 	if triggeredVersions[0].CommentID != int64(1000+cursorPR) {
 		t.Errorf("triggered version CommentID = %d, want %d", triggeredVersions[0].CommentID, 1000+cursorPR)
+	}
+}
+
+// pullRequestsGraphQLResponse builds a minimal GraphQL response body for
+// GetPullRequests' query, containing a single open PR with the given
+// number/commit, no next page.
+func pullRequestsGraphQLResponse(number int, headSHA string) string {
+	return fmt.Sprintf(`{"data":{"repository":{"pullRequests":{"edges":[{"node":{
+		"number": %d,
+		"title": "test PR",
+		"url": "https://github.com/owner/repo/pull/%d",
+		"state": "OPEN",
+		"isDraft": false,
+		"baseRefName": "main",
+		"headRefName": "feature",
+		"headRefOid": %q,
+		"repository": {"url": "https://github.com/owner/repo"},
+		"headRepository": {"url": "https://github.com/owner/repo"},
+		"author": {"login": "someone", "avatarUrl": ""},
+		"labels": {"nodes": []},
+		"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": "2026-01-01T00:00:00Z", "additions": 1, "deletions": 0}}]},
+		"reviews": {"nodes": []}
+	}}], "pageInfo": {"endCursor": "", "hasNextPage": false}}}}}`, number, number, headSHA, headSHA)
+}
+
+// TestCheck_NewCommitOnAlreadyTrackedPR_IsDetected is a regression test for
+// the bug where an already-tracked PR's new commit was silently dropped.
+// The removed filterNewVersions helper matched purely on PR number: once a
+// PR had been seen once (became the resource's "last known version"), any
+// later commit to that SAME PR was found at "the cursor" and skipped
+// forever, no matter how much its Commit/CommittedDate changed. Check must
+// now return the PR's current version unconditionally so Concourse's own
+// version-history dedup — not our own flawed position heuristic — decides
+// what's actually new.
+func TestCheck_NewCommitOnAlreadyTrackedPR_IsDetected(t *testing.T) {
+	const prNumber = 32
+	const oldSHA = "aaa111"
+	const newSHA = "bbb222"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, pullRequestsGraphQLResponse(prNumber, newSHA))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	gc := &models.GithubClient{
+		V4:     githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{Repository: "owner/repo"},
+	}
+
+	// Simulate: this PR was already the resource's last-known version, at
+	// its OLD commit — exactly the state after a prior check first
+	// discovered it.
+	request := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: &models.Version{PR: strconv.Itoa(prNumber), Commit: oldSHA},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(versions) != 1 {
+		t.Fatalf("got %d versions, want exactly 1 (the PR's new commit): %+v", len(versions), versions)
+	}
+	if versions[0].PR != strconv.Itoa(prNumber) {
+		t.Errorf("versions[0].PR = %s, want %d", versions[0].PR, prNumber)
+	}
+	if versions[0].Commit != newSHA {
+		t.Errorf("versions[0].Commit = %s, want %s (new commit was dropped — the bug is back)", versions[0].Commit, newSHA)
 	}
 }

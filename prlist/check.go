@@ -34,7 +34,20 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 		return nil, err
 	}
 
-	// Convert to versions
+	// Return the current version of every matching PR, every check — not
+	// just whatever comes "after" the last known version's PR in this
+	// list. An earlier version of this function tried to save bandwidth by
+	// only returning entries positioned after the last-known PR's spot in
+	// the freshly fetched list (filterNewVersions, since removed). That
+	// matched purely on PR NUMBER, so once a PR had been seen once, any
+	// later commit pushed to that SAME PR was silently dropped forever —
+	// its entry was always found at "the cursor" and skipped, no matter
+	// how much its Commit/CommittedDate had changed since. Concourse's ATC
+	// already dedups by exact version equality against its own recorded
+	// history, so returning the full snapshot is both simpler and
+	// correct: an unchanged PR's version is a no-op, while a PR with a new
+	// commit (or a brand-new PR) is picked up as new regardless of its
+	// position in the list.
 	var versions []models.Version
 	for _, pr := range filteredPRs {
 		versions = append(versions, models.Version{
@@ -45,12 +58,9 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 		})
 	}
 
-	// If we have a previous version, only return new versions
-	if request.Version != nil {
-		versions = filterNewVersions(versions, *request.Version)
-	}
-
-	// If no new versions, return the current version to indicate no changes
+	// If nothing currently matches (e.g. no open PRs touch the configured
+	// paths), echo back the last known version so the resource doesn't
+	// appear to lose its place.
 	if len(versions) == 0 && request.Version != nil {
 		versions = []models.Version{*request.Version}
 	}
@@ -191,27 +201,4 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	}
 
 	return versions, nil
-}
-
-// filterNewVersions returns only the versions that are newer than the given version
-func filterNewVersions(versions []models.Version, lastVersion models.Version) []models.Version {
-	var newVersions []models.Version
-	foundLast := false
-
-	for _, v := range versions {
-		if v.PR == lastVersion.PR {
-			foundLast = true
-			continue
-		}
-		if foundLast {
-			newVersions = append(newVersions, v)
-		}
-	}
-
-	// If we didn't find the last version in the list, return all versions
-	if !foundLast {
-		return versions
-	}
-
-	return newVersions
 }
