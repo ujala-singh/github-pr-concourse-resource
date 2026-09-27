@@ -268,12 +268,16 @@ In both modes, the very first `trigger_comments`-eligible check for a PR (or the
 
 ### `check` 
 
-**PR List Mode**: Returns list of PRs matching the filter criteria. A new version is emitted when:
+**PR List Mode**: Returns the current version of every PR matching the filter criteria, on every check. A new version is picked up by Concourse when:
 - A new PR is opened
+- An existing, already-tracked PR gets a new commit
 - A PR is closed/merged
 - A PR's state changes (e.g., from draft to ready)
+- (if `trigger_comments` is set) a new matching comment is posted — see [Comment Triggers](#comment-triggers)
 
-**Single PR Mode**: Returns list of commits to the specified PR. A new version is emitted for each new commit.
+**Single PR Mode**: Returns list of commits to the specified PR. A new version is emitted for each new commit, or (if `trigger_comments` is set) for a matching comment.
+
+> Every version this resource returns carries two extra fields you'll see in Concourse's resource-version listing whenever `trigger_comments` is configured: `comment_id` and `comment_baseline`. These are an internal watermark, not a log of every comment ever posted — `comment_id` is just the highest matching-comment ID seen so far, and `comment_baseline` marks that the watermark has been established at least once. They show up on ordinary commit-triggered versions too (not just comment-triggered ones) because the resource needs that watermark carried forward on every version to correctly detect the *next* new comment. If you don't set `trigger_comments`, neither field appears.
 
 ### `get` (in)
 
@@ -298,18 +302,21 @@ Parameters:
 
 ### `put` (out)
 
-**Only available in Single PR Mode**. Updates PR status and adds comments.
+Updates PR status and adds comments. Available in **both modes** — `cmd/out` always runs the same underlying implementation regardless of `number` being set, using whatever PR was checked out by the preceding `get` step.
 
 Parameters:
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `path` | Yes | Path to the PR resource from `get` |
 | `status` | No | Commit status: `success`, `failure`, `error`, `pending` |
-| `context` | No | Status context (default: `concourse-ci`) |
+| `base_context` | No | Status context prefix (default: `concourse-ci`) |
+| `context` | No | Status context suffix (default: `status`) |
 | `target_url` | No | URL to link from the status |
 | `description` | No | Status description |
+| `description_file` | No | File containing the status description |
 | `comment` | No | Comment text to add to PR |
 | `comment_file` | No | File containing comment text |
+| `delete_previous_comments` | No | Delete this resource's earlier comments on the PR before adding a new one |
 
 ## Metadata
 
