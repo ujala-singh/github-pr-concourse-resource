@@ -42,12 +42,19 @@ GitHub Apps offer several advantages over personal access tokens:
 
 ## Configuration
 
-Configure the Concourse resource with GitHub App credentials:
+Register the resource type once, then configure the resource with GitHub App credentials:
 
 ```yaml
+resource_types:
+  - name: github-pr
+    type: registry-image
+    source:
+      repository: ghcr.io/ujala-singh/github-pr-concourse-resource
+      tag: latest
+
 resources:
   - name: pr-resource
-    type: github-pr-concourse-resource
+    type: github-pr
     source:
       repository: owner/repo
       github_app_id: "12345"                    # Your App ID
@@ -66,7 +73,7 @@ Store the private key securely using a credential manager:
 ```yaml
 resources:
   - name: pr-resource
-    type: github-pr-concourse-resource
+    type: github-pr
     source:
       repository: owner/repo
       github_app_id: ((github-app-id))
@@ -81,7 +88,7 @@ For GitHub Enterprise Server, also specify the endpoints:
 ```yaml
 resources:
   - name: pr-resource
-    type: github-pr-concourse-resource
+    type: github-pr
     source:
       repository: owner/repo
       github_app_id: ((github-app-id))
