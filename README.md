@@ -38,6 +38,7 @@ A modern, feature-rich Concourse CI resource for GitHub Pull Requests with dual-
 - Git LFS support
 - Configurable git depth
 - Multi-architecture support (amd64, arm64)
+- PR list mode checks up to 8 PRs concurrently (path filtering, comment scanning) instead of one at a time — see [Concurrency](#concurrency)
 
 ## 📦 Installation
 
@@ -278,6 +279,14 @@ In both modes, the very first `trigger_comments`-eligible check for a PR (or the
 **Single PR Mode**: Returns list of commits to the specified PR. A new version is emitted for each new commit, or (if `trigger_comments` is set) for a matching comment.
 
 > Every version this resource returns carries two extra fields you'll see in Concourse's resource-version listing whenever `trigger_comments` is configured: `comment_id` and `comment_baseline`. These are an internal watermark, not a log of every comment ever posted — `comment_id` is just the highest matching-comment ID seen so far, and `comment_baseline` marks that the watermark has been established at least once. They show up on ordinary commit-triggered versions too (not just comment-triggered ones) because the resource needs that watermark carried forward on every version to correctly detect the *next* new comment. If you don't set `trigger_comments`, neither field appears.
+
+### Concurrency
+
+**PR List Mode only.** A single check does one GitHub API call per PR per pass — one to test `paths`/`ignore_paths`, and (if `trigger_comments` is set) another to scan that PR's comments. With many open PRs on the repo, running these sequentially can make one check take tens of seconds and eat into the GitHub App's rate limit.
+
+To reduce that, both passes run with up to **8 PRs in flight concurrently** (a fixed internal bound, not currently configurable via source config). This cuts wall-clock time per check roughly by that factor on repos with many matching PRs; it does not reduce the total number of GitHub API calls made, so it doesn't help with rate-limit *budget* — only with how long a single check takes to run. Output order is unaffected: results are always assembled back into the same order GitHub returned the PRs in, regardless of which concurrent call finishes first.
+
+Single PR Mode does not need this — it tracks exactly one PR, so there's nothing to parallelize.
 
 ### `get` (in)
 
