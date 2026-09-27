@@ -1,8 +1,14 @@
 package pr
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/shurcooL/githubv4"
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
 
@@ -422,5 +428,97 @@ func TestVersion_CommentBaseline(t *testing.T) {
 
 	if preFeatureVersion.CommentID == establishedNoMatch.CommentID && preFeatureVersion.CommentBaseline == establishedNoMatch.CommentBaseline {
 		t.Fatalf("pre-feature and established-with-no-match versions must be distinguishable via CommentBaseline")
+	}
+}
+
+// singlePRGraphQLResponse builds a minimal GraphQL response body for
+// GetPullRequest's query.
+func singlePRGraphQLResponse(number int, headSHA string) string {
+	return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{
+		"number": %d,
+		"title": "test PR",
+		"url": "https://github.com/owner/repo/pull/%d",
+		"state": "OPEN",
+		"isDraft": false,
+		"baseRefName": "main",
+		"headRefName": "feature",
+		"headRefOid": %q,
+		"repository": {"url": "https://github.com/owner/repo"},
+		"headRepository": {"url": "https://github.com/owner/repo"},
+		"author": {"login": "someone", "avatarUrl": ""},
+		"labels": {"nodes": []},
+		"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": "2026-01-01T00:00:00Z", "additions": 1, "deletions": 0}}]},
+		"reviews": {"nodes": []}
+	}}}}`, number, number, headSHA, headSHA)
+}
+
+// TestOut_PropagatesCommentWatermarkFromVersionJSON is a regression test
+// for a bug where Out's response version always had a zero-value
+// CommentID/CommentBaseline, regardless of what triggered the build. Since
+// Check stamps those fields on every version it returns once
+// trigger_comments is configured, Out's response — missing them — looked
+// like a brand-new, never-seen version to Concourse's ATC. That caused the
+// job's own status-update `put` steps (pending/success/failure) to
+// register a "new" version and re-trigger the very job that just ran, on
+// the same commit, with no new comment or commit involved.
+//
+// Out has no direct channel from Concourse for "the version that triggered
+// this build" (the put/out protocol doesn't pass one) — it must recover it
+// from version.json, written by In into the checked-out resource
+// directory. This test writes that file by hand to pin the on-disk
+// contract In and Out share.
+func TestOut_PropagatesCommentWatermarkFromVersionJSON(t *testing.T) {
+	const prNumber = 42
+	const headSHA = "abc123"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, singlePRGraphQLResponse(prNumber, headSHA))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	gc := &models.GithubClient{
+		V4:     githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{Repository: "owner/repo"},
+	}
+
+	sourcesDir := t.TempDir()
+	resourceDir := filepath.Join(sourcesDir, "pull-request", ".git", "resource")
+	if err := os.MkdirAll(resourceDir, 0755); err != nil {
+		t.Fatalf("failed to create resource dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(resourceDir, "pr"), fmt.Appendf(nil, "%d", prNumber), 0644); err != nil {
+		t.Fatalf("failed to write pr file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(resourceDir, "head_sha"), []byte(headSHA), 0644); err != nil {
+		t.Fatalf("failed to write head_sha file: %v", err)
+	}
+
+	// The version that triggered this build, as In would have written it.
+	triggeringVersion := models.Version{PR: "42", Commit: headSHA, CommentID: 9999, CommentBaseline: true}
+	versionJSON, err := triggeringVersion.MarshalJSON()
+	if err != nil {
+		t.Fatalf("failed to marshal triggering version: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(resourceDir, "version.json"), versionJSON, 0644); err != nil {
+		t.Fatalf("failed to write version.json: %v", err)
+	}
+
+	request := OutRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Params: OutParams{Path: "pull-request"},
+	}
+
+	response, err := Out(request, gc, sourcesDir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if response.Version.CommentID != 9999 {
+		t.Errorf("Version.CommentID = %d, want 9999 (dropped the triggering version's watermark)", response.Version.CommentID)
+	}
+	if !response.Version.CommentBaseline {
+		t.Errorf("Version.CommentBaseline = false, want true (dropped the triggering version's watermark)")
 	}
 }

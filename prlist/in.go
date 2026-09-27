@@ -132,11 +132,17 @@ func writeMetadataFiles(destDir string, metadata []models.Metadata, version mode
 		}
 	}
 
-	// Write version.json
+	// Write version.json using the same encoding Check/In/Out exchange with
+	// Concourse (see Version.MarshalJSON), so Out (shared with single-PR
+	// mode — see cmd/out/main.go) can read this file back and recover
+	// fields — like CommentID/CommentBaseline — that aren't otherwise
+	// derivable from the checked-out working directory.
 	versionPath := filepath.Join(resourceDir, "version.json")
-	versionJSON := fmt.Sprintf(`{"pr":"%s","commit":"%s","committed":"%s","approved_review_count":%d}`,
-		version.PR, version.Commit, version.CommittedDate, version.ApprovedReviewCount)
-	if err := os.WriteFile(versionPath, []byte(versionJSON), 0644); err != nil {
+	versionJSON, err := version.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("failed to marshal version.json: %w", err)
+	}
+	if err := os.WriteFile(versionPath, versionJSON, 0644); err != nil {
 		return fmt.Errorf("failed to write version.json: %w", err)
 	}
 
