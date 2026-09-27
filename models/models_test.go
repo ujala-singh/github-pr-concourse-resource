@@ -79,6 +79,50 @@ func TestCommonConfig_Validate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "unset check_concurrency uses default",
+			config: CommonConfig{
+				Repository:  "owner/repo",
+				AccessToken: "token123",
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid check_concurrency",
+			config: CommonConfig{
+				Repository:       "owner/repo",
+				AccessToken:      "token123",
+				CheckConcurrency: 10,
+			},
+			wantErr: false,
+		},
+		{
+			name: "check_concurrency at upper bound",
+			config: CommonConfig{
+				Repository:       "owner/repo",
+				AccessToken:      "token123",
+				CheckConcurrency: 50,
+			},
+			wantErr: false,
+		},
+		{
+			name: "check_concurrency above upper bound",
+			config: CommonConfig{
+				Repository:       "owner/repo",
+				AccessToken:      "token123",
+				CheckConcurrency: 51,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative check_concurrency",
+			config: CommonConfig{
+				Repository:       "owner/repo",
+				AccessToken:      "token123",
+				CheckConcurrency: -1,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

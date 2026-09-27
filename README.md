@@ -38,7 +38,7 @@ A modern, feature-rich Concourse CI resource for GitHub Pull Requests with dual-
 - Git LFS support
 - Configurable git depth
 - Multi-architecture support (amd64, arm64)
-- PR list mode checks up to 8 PRs concurrently (path filtering, comment scanning) instead of one at a time — see [Concurrency](#concurrency)
+- PR list mode checks up to 10 PRs concurrently by default, configurable via `check_concurrency` (path filtering, comment scanning) instead of one at a time — see [Concurrency](#concurrency)
 
 ## 📦 Installation
 
@@ -228,6 +228,7 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `states` | No | `["OPEN"]` | PR states to track: `OPEN`, `MERGED`, `CLOSED` |
 | `concourse_url` | No | - | Override the public URL used for PR status check "Details" links. Useful when Concourse's `externalUrl` Helm value is locked to a different hostname (e.g. an STS WebIdentity OIDC issuer) but builds are reached via a proxy or alternate domain. When set, this value replaces `ATC_EXTERNAL_URL` for the `put` step. |
 | `trigger_comments` | No | `[]` | Comment prefixes (case-insensitive) that re-trigger the job as if a new commit had arrived, without pushing one. E.g. `["concourse plan"]` lets a PR comment of "concourse plan" (or "concourse plan --all", etc.) re-run the job against the PR's current HEAD. See [Comment Triggers](#comment-triggers) below. |
+| `check_concurrency` | No | `10` | **PR list mode only** (ignored in single-PR mode). How many PRs to inspect in parallel per check (path filtering, comment scanning). Must be between 1 and 50 if set. See [Concurrency](#concurrency) below. |
 
 > **Note:** Either `access_token` OR all three GitHub App parameters (`github_app_id`, `github_app_installation_id`, `github_app_private_key`) must be provided.
 
@@ -284,7 +285,7 @@ In both modes, the very first `trigger_comments`-eligible check for a PR (or the
 
 **PR List Mode only.** A single check does one GitHub API call per PR per pass — one to test `paths`/`ignore_paths`, and (if `trigger_comments` is set) another to scan that PR's comments. With many open PRs on the repo, running these sequentially can make one check take tens of seconds and eat into the GitHub App's rate limit.
 
-To reduce that, both passes run with up to **8 PRs in flight concurrently** (a fixed internal bound, not currently configurable via source config). This cuts wall-clock time per check roughly by that factor on repos with many matching PRs; it does not reduce the total number of GitHub API calls made, so it doesn't help with rate-limit *budget* — only with how long a single check takes to run. Output order is unaffected: results are always assembled back into the same order GitHub returned the PRs in, regardless of which concurrent call finishes first.
+To reduce that, both passes run with up to `check_concurrency` PRs in flight concurrently — **10 by default**, configurable up to 50 (see the `check_concurrency` source field above). This cuts wall-clock time per check roughly by that factor on repos with many matching PRs; it does not reduce the total number of GitHub API calls made, so it doesn't help with rate-limit *budget* — only with how long a single check takes to run. Raising it further mostly just shifts where the bottleneck is, into GitHub's own per-token concurrency/secondary rate limits. Output order is unaffected: results are always assembled back into the same order GitHub returned the PRs in, regardless of which concurrent call finishes first.
 
 Single PR Mode does not need this — it tracks exactly one PR, so there's nothing to parallelize.
 
