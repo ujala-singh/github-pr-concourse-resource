@@ -49,6 +49,12 @@ type CommonConfig struct {
 	// moves on to a different PR, that PR's comment watermark is lost until
 	// it's re-established — see prlist.applyCommentTriggers.
 	TriggerComments []string `json:"trigger_comments"`
+	// CheckConcurrency bounds how many PRs are inspected in parallel during a
+	// single PR-list mode check (path filtering, comment scanning). Ignored
+	// by single-PR mode, which only ever tracks one PR. Zero or unset uses
+	// the default (see prlist.DefaultCheckConcurrency); must be between 1
+	// and 50 if set.
+	CheckConcurrency int `json:"check_concurrency"`
 }
 
 // GithubConfig contains GitHub-specific configuration
@@ -114,6 +120,11 @@ func (c *CommonConfig) Validate() error {
 				return fmt.Errorf("invalid state: %s (must be OPEN, MERGED, or CLOSED)", state)
 			}
 		}
+	}
+
+	// Validate check_concurrency
+	if c.CheckConcurrency < 0 || c.CheckConcurrency > 50 {
+		return fmt.Errorf("check_concurrency must be between 1 and 50 (0 uses the default): got %d", c.CheckConcurrency)
 	}
 
 	return nil

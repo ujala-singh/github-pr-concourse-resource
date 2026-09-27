@@ -173,12 +173,12 @@ func newTestGithubClient(t *testing.T, mux *http.ServeMux) *models.GithubClient 
 
 // TestRunBounded_CallsEveryIndexExactlyOnce verifies the worker pool covers
 // every index in [0, n) exactly once, including n larger than
-// checkConcurrency (forcing multiple batches) and n == 0 (no-op).
+// DefaultCheckConcurrency (forcing multiple batches) and n == 0 (no-op).
 func TestRunBounded_CallsEveryIndexExactlyOnce(t *testing.T) {
-	for _, n := range []int{0, 1, checkConcurrency, checkConcurrency*3 + 1} {
+	for _, n := range []int{0, 1, DefaultCheckConcurrency, DefaultCheckConcurrency*3 + 1} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
 			seen := make([]int32, n)
-			runBounded(n, func(i int) {
+			runBounded(n, DefaultCheckConcurrency, func(i int) {
 				atomic.AddInt32(&seen[i], 1)
 			})
 			for i, count := range seen {
@@ -191,7 +191,7 @@ func TestRunBounded_CallsEveryIndexExactlyOnce(t *testing.T) {
 }
 
 // TestRunBounded_RespectsConcurrencyLimit verifies no more than
-// checkConcurrency goroutines run fn at the same time.
+// DefaultCheckConcurrency goroutines run fn at the same time.
 func TestRunBounded_RespectsConcurrencyLimit(t *testing.T) {
 	var (
 		mu        sync.Mutex
@@ -200,8 +200,8 @@ func TestRunBounded_RespectsConcurrencyLimit(t *testing.T) {
 		callCount int
 	)
 
-	n := checkConcurrency * 4
-	runBounded(n, func(i int) {
+	n := DefaultCheckConcurrency * 4
+	runBounded(n, DefaultCheckConcurrency, func(i int) {
 		mu.Lock()
 		current++
 		callCount++
@@ -220,8 +220,8 @@ func TestRunBounded_RespectsConcurrencyLimit(t *testing.T) {
 	if callCount != n {
 		t.Fatalf("callCount = %d, want %d", callCount, n)
 	}
-	if maxSeen > checkConcurrency {
-		t.Errorf("observed %d concurrent calls, want at most %d", maxSeen, checkConcurrency)
+	if maxSeen > DefaultCheckConcurrency {
+		t.Errorf("observed %d concurrent calls, want at most %d", maxSeen, DefaultCheckConcurrency)
 	}
 }
 
@@ -282,7 +282,7 @@ func TestFilterPRsByPath_PreservesInputOrder(t *testing.T) {
 		{Number: 1}, {Number: 2}, {Number: 3}, {Number: 4}, {Number: 5},
 	}
 
-	filtered, err := filterPRsByPath(context.Background(), gc, prs)
+	filtered, err := filterPRsByPath(context.Background(), gc, prs, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestFilterPRsByPath_PropagatesErrorFromAnyWorker(t *testing.T) {
 
 	prs := []*models.PullRequest{{Number: 1}, {Number: 2}, {Number: 3}}
 
-	_, err := filterPRsByPath(context.Background(), gc, prs)
+	_, err := filterPRsByPath(context.Background(), gc, prs, DefaultCheckConcurrency)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -333,7 +333,7 @@ func TestApplyCommentTriggers_FirstObservation_EstablishesBaselineWithoutFiring(
 		Version: nil, // no prior version at all — this PR has never been observed
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 		Version: prevVersion,
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.
 		Version: prevVersion,
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.
 }
 
 // TestApplyCommentTriggers_ManyPRsConcurrently scans more PRs than
-// checkConcurrency at once (forcing multiple bounded worker batches) and
+// DefaultCheckConcurrency at once (forcing multiple bounded worker batches) and
 // verifies two things despite goroutines completing out of order:
 //  1. Every PR's watermark gets stamped onto its pre-existing version
 //     correctly (the concurrent GitHub calls all land in the right slot).
@@ -408,8 +408,8 @@ func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.
 //     doc comment). A PR with a genuinely new comment but no established
 //     baseline must NOT trigger, concurrency or not.
 func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
-	const n = checkConcurrency*2 + 3 // force multiple bounded batches
-	const cursorPR = 5               // arbitrary PR whose baseline is established
+	const n = DefaultCheckConcurrency*2 + 3 // force multiple bounded batches
+	const cursorPR = 5                      // arbitrary PR whose baseline is established
 
 	mux := http.NewServeMux()
 	prs := make([]*models.PullRequest, n)
@@ -452,7 +452,7 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		Version: &models.Version{PR: strconv.Itoa(cursorPR), CommentID: 100, CommentBaseline: true},
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, prs, preExisting)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, prs, preExisting, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -556,4 +556,127 @@ func TestCheck_NewCommitOnAlreadyTrackedPR_IsDetected(t *testing.T) {
 	if versions[0].Commit != newSHA {
 		t.Errorf("versions[0].Commit = %s, want %s (new commit was dropped — the bug is back)", versions[0].Commit, newSHA)
 	}
+}
+
+func TestResolveCheckConcurrency(t *testing.T) {
+	tests := []struct {
+		name   string
+		source Source
+		want   int
+	}{
+		{
+			name:   "unset uses default",
+			source: Source{},
+			want:   DefaultCheckConcurrency,
+		},
+		{
+			name:   "zero uses default",
+			source: Source{CommonConfig: models.CommonConfig{CheckConcurrency: 0}},
+			want:   DefaultCheckConcurrency,
+		},
+		{
+			name:   "configured value is used as-is",
+			source: Source{CommonConfig: models.CommonConfig{CheckConcurrency: 25}},
+			want:   25,
+		},
+		{
+			name:   "configured value of 1 is respected, not treated as unset",
+			source: Source{CommonConfig: models.CommonConfig{CheckConcurrency: 1}},
+			want:   1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveCheckConcurrency(tt.source)
+			if got != tt.want {
+				t.Errorf("resolveCheckConcurrency() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheck_RespectsConfiguredCheckConcurrency proves source.check_concurrency
+// actually reaches the worker pool end-to-end through Check, not just
+// resolveCheckConcurrency in isolation: it sets a concurrency of 1 (fully
+// sequential) and asserts no two path-filter calls ever overlap, then
+// repeats with a higher value and asserts overlap does happen — ruling out
+// a test that would pass even if Check silently ignored the config.
+func TestCheck_RespectsConfiguredCheckConcurrency(t *testing.T) {
+	const prCount = 6
+
+	newServerAndClient := func(t *testing.T, trackConcurrency func(delta int)) *models.GithubClient {
+		t.Helper()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+			var edges []string
+			for i := 1; i <= prCount; i++ {
+				edges = append(edges, fmt.Sprintf(`{"node":{
+					"number": %d, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+					"baseRefName": "main", "headRefName": "f", "headRefOid": "sha%d",
+					"repository": {"url": "u"}, "headRepository": {"url": "u"},
+					"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+					"commits": {"nodes": [{"commit": {"oid": "sha%d", "committedDate": "2026-01-01T00:00:00Z", "additions": 1, "deletions": 0}}]},
+					"reviews": {"nodes": []}
+				}}`, i, i, i))
+			}
+			_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`,
+				strings.Join(edges, ","))
+		})
+		for i := 1; i <= prCount; i++ {
+			mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", i), func(w http.ResponseWriter, r *http.Request) {
+				trackConcurrency(1)
+				time.Sleep(20 * time.Millisecond)
+				trackConcurrency(-1)
+				_, _ = fmt.Fprint(w, `[{"filename": "terraform/a.tf"}]`)
+			})
+		}
+		server := httptest.NewServer(mux)
+		t.Cleanup(server.Close)
+
+		v3 := github.NewClient(nil)
+		baseURL, err := url.Parse(server.URL + "/")
+		if err != nil {
+			t.Fatalf("failed to parse test server URL: %v", err)
+		}
+		v3.BaseURL = baseURL
+
+		return &models.GithubClient{
+			V3:     v3,
+			V4:     githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+			Config: models.CommonConfig{Repository: "owner/repo", Paths: []string{"terraform/**"}},
+		}
+	}
+
+	runWithConcurrency := func(t *testing.T, concurrency int) (maxObserved int) {
+		var mu sync.Mutex
+		var current int
+		gc := newServerAndClient(t, func(delta int) {
+			mu.Lock()
+			current += delta
+			if current > maxObserved {
+				maxObserved = current
+			}
+			mu.Unlock()
+		})
+		gc.Config.CheckConcurrency = concurrency
+
+		request := CheckRequest{Source: Source{CommonConfig: gc.Config}}
+		if _, err := Check(request, gc); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return maxObserved
+	}
+
+	t.Run("check_concurrency=1 is fully sequential", func(t *testing.T) {
+		if got := runWithConcurrency(t, 1); got != 1 {
+			t.Errorf("max concurrent path-filter calls = %d, want 1 (check_concurrency=1 was not respected)", got)
+		}
+	})
+
+	t.Run("check_concurrency=6 allows overlap", func(t *testing.T) {
+		if got := runWithConcurrency(t, prCount); got <= 1 {
+			t.Errorf("max concurrent path-filter calls = %d, want > 1 (check_concurrency=%d had no effect)", got, prCount)
+		}
+	})
 }

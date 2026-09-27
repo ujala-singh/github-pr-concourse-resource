@@ -9,27 +9,39 @@ import (
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
 
-// checkConcurrency bounds how many PRs are inspected in parallel per check
-// (path filtering, comment scanning). List mode does one GitHub API call
-// per PR per pass — with many open PRs on the repo, running these
-// sequentially can make a single check take tens of seconds and eat into
-// the GitHub App's rate limit. This trades some of that rate-limit budget
-// for lower per-check latency; it's a constant rather than a source field
-// since raising it further mostly just shifts where the bottleneck is
-// (GitHub's own per-token concurrency/secondary rate limits).
-const checkConcurrency = 8
+// DefaultCheckConcurrency bounds how many PRs are inspected in parallel per
+// check (path filtering, comment scanning) when source.check_concurrency is
+// unset. List mode does one GitHub API call per PR per pass — with many
+// open PRs on the repo, running these sequentially can make a single check
+// take tens of seconds and eat into the GitHub App's rate limit. This
+// trades some of that rate-limit budget for lower per-check latency;
+// raising it further mostly just shifts where the bottleneck is (GitHub's
+// own per-token concurrency/secondary rate limits) — see
+// CommonConfig.CheckConcurrency for the configurable override.
+const DefaultCheckConcurrency = 10
+
+// resolveCheckConcurrency returns the effective concurrency bound for a
+// check: the configured source.check_concurrency if set (validated to be
+// in [1, 50] by CommonConfig.Validate), otherwise DefaultCheckConcurrency.
+func resolveCheckConcurrency(source Source) int {
+	if source.CheckConcurrency > 0 {
+		return source.CheckConcurrency
+	}
+	return DefaultCheckConcurrency
+}
 
 // Check performs the check operation for PR list mode
 // Returns a list of versions representing the current set of PRs
 func Check(request CheckRequest, github *models.GithubClient) ([]models.Version, error) {
 	ctx := context.Background()
+	concurrency := resolveCheckConcurrency(request.Source)
 
 	prs, err := github.GetPullRequests(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pull requests: %w", err)
 	}
 
-	filteredPRs, err := filterPRsByPath(ctx, github, prs)
+	filteredPRs, err := filterPRsByPath(ctx, github, prs, concurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +79,7 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 
 	if len(request.Source.TriggerComments) > 0 {
 		var err error
-		versions, err = applyCommentTriggers(ctx, request, github, filteredPRs, versions)
+		versions, err = applyCommentTriggers(ctx, request, github, filteredPRs, versions, concurrency)
 		if err != nil {
 			return nil, err
 		}
@@ -76,11 +88,16 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	return versions, nil
 }
 
-// runBounded runs fn(i) for i in [0, n) with at most checkConcurrency
-// goroutines in flight at once, and waits for all of them to finish.
-func runBounded(n int, fn func(i int)) {
+// runBounded runs fn(i) for i in [0, n) with at most concurrency goroutines
+// in flight at once, and waits for all of them to finish. concurrency <= 0
+// is treated as 1 (no parallelism).
+func runBounded(n int, concurrency int, fn func(i int)) {
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, checkConcurrency)
+	sem := make(chan struct{}, concurrency)
 
 	for i := range n {
 		wg.Add(1)
@@ -96,14 +113,14 @@ func runBounded(n int, fn func(i int)) {
 }
 
 // filterPRsByPath applies source.paths/ignore_paths to each PR concurrently
-// (bounded by checkConcurrency) and returns the matching PRs in the same
-// order GetPullRequests returned them, so downstream cursor-based version
-// diffing stays deterministic regardless of which goroutine finishes first.
-func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*models.PullRequest) ([]*models.PullRequest, error) {
+// (bounded by concurrency) and returns the matching PRs in the same order
+// GetPullRequests returned them, so downstream cursor-based version diffing
+// stays deterministic regardless of which goroutine finishes first.
+func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*models.PullRequest, concurrency int) ([]*models.PullRequest, error) {
 	matches := make([]bool, len(prs))
 	errs := make([]error, len(prs))
 
-	runBounded(len(prs), func(i int) {
+	runBounded(len(prs), concurrency, func(i int) {
 		m, err := github.MatchesPathFilters(ctx, prs[i])
 		matches[i] = m
 		errs[i] = err
@@ -135,7 +152,7 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // immediately. This is best-effort: reliable when at most one PR is being
 // actively worked on at a time, but can miss (or, rarely, double-fire) a
 // trigger under heavy concurrent PR churn across many matching PRs.
-func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, filteredPRs []*models.PullRequest, versions []models.Version) ([]models.Version, error) {
+func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, filteredPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
 	type result struct {
 		latestMatchID int64
 		triggered     bool
@@ -147,7 +164,7 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	// version-mutation pass below stays sequential over filteredPRs in its
 	// original order, so the output is deterministic regardless of which
 	// goroutine finishes first.
-	runBounded(len(filteredPRs), func(i int) {
+	runBounded(len(filteredPRs), concurrency, func(i int) {
 		pr := filteredPRs[i]
 		prKey := strconv.Itoa(pr.Number)
 
