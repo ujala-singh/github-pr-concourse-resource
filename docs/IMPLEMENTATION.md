@@ -57,6 +57,7 @@ github-pr-concourse-resource/
 ✅ PR comments
 ✅ Changed files listing
 ✅ Enhanced security checks
+✅ Bounded-concurrency PR list checks (up to 8 in flight) — see [README#concurrency](../README.md#concurrency)
 
 ### Modern Stack
 ✅ Go 1.26+
