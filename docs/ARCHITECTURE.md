@@ -12,25 +12,25 @@
 │  │  │ (cmd/)   │    │ (cmd/)   │    │ (cmd/)   │            │  │
 │  │  └────┬─────┘    └────┬─────┘    └────┬─────┘            │  │
 │  │       │               │               │                  │  │
-│  │       └───────┬───────┴───────┬───────┘                  │  │
-│  │               │               │                          │  │
-│  │        Detects source.number  │                          │  │
-│  │               │               │                          │  │
-│  │       ┌───────┴────┬──────────┴─────┐                    │  │
-│  │       ▼            ▼                ▼                    │  │
-│  │  ┌─────────┐  ┌─────────┐    ┌──────────┐                │  │
-│  │  │ prlist/ │  │   pr/   │    │   pr/    │                │  │
-│  │  │  check  │  │  check  │    │   out    │                │  │
-│  │  └────┬────┘  └────┬────┘    └────┬─────┘                │  │
-│  │       │            │              │                      │  │
-│  │  ┌─────────┐  ┌─────────┐    ┌──────────┐                │  │
-│  │  │ prlist/ │  │   pr/   │    │          │                │  │
-│  │  │   in    │  │   in    │    │   out    │                │  │
-│  │  └────┬────┘  └────┬────┘    └────┬─────┘                │  │
-│  │       │            │              │                      │  │
-│  └───────┼────────────┼──────────────┼──────────────────────┘  │
-│          │            │              │                         │
-│          └────────────┴──────────────┘                         │
+│  │       └───────┬───────┘               │                  │  │
+│  │               │                       │                  │  │
+│  │        Detects source.number    No mode dispatch —       │  │
+│  │               │                 always calls pr.Out,     │  │
+│  │       ┌───────┴────┐             both modes share it     │  │
+│  │       ▼            ▼                  │                  │  │
+│  │  ┌─────────┐  ┌─────────┐        ┌──────────┐            │  │
+│  │  │ prlist/ │  │   pr/   │        │   pr/    │            │  │
+│  │  │  check  │  │  check  │        │   out    │            │  │
+│  │  └────┬────┘  └────┬────┘        └────┬─────┘            │  │
+│  │       │            │                  │                  │  │
+│  │  ┌─────────┐  ┌─────────┐             │                  │  │
+│  │  │ prlist/ │  │   pr/   │             │                  │  │
+│  │  │   in    │  │   in    │             │                  │  │
+│  │  └────┬────┘  └────┬────┘             │                  │  │
+│  │       │            │                  │                  │  │
+│  └───────┼────────────┼──────────────────┼──────────────────┘  │
+│          │            │                  │                     │
+│          └────────────┴──────────────────┘                     │
 │                       ▼                                        │
 │          ┌────────────────────────┐                            │
 │          │     models/            │                            │
@@ -47,6 +47,8 @@
 │          │  │  - GetCommits    │  │                            │
 │          │  │  - UpdateStatus  │  │                            │
 │          │  │  - AddComment    │  │                            │
+│          │  │  - CheckTrigger- │  │                            │
+│          │  │    Comments      │  │                            │
 │          │  └──────────────────┘  │                            │
 │          │                        │                            │
 │          │  Configuration Types:  │                            │
@@ -92,12 +94,19 @@
    │              │     │              │
    │ - Track all  │     │ - Track one  │
    │   PRs        │     │   PR commits │
-   │ - Metadata   │     │ - Clone repo │
-   │   only       │     │ - Merge/     │
-   │ - Instance   │     │   Rebase     │
-   │   pipelines  │     │ - Status     │
-   │              │     │   updates    │
+   │ - Clone repo │     │ - Clone repo │
+   │   by default │     │   + merge/   │
+   │   (skip with │     │   rebase     │
+   │   params:    │     │              │
+   │  skip_down-  │     │              │
+   │  load: true) │     │              │
+   │ - Feeds      │     │              │
+   │   instance   │     │              │
+   │   pipelines  │     │              │
    └──────────────┘     └──────────────┘
+
+Status updates and comments (put/out) are available in BOTH modes —
+cmd/out has no mode dispatch (see diagram above).
 
 
                 Data Flow
@@ -115,8 +124,10 @@ Check (pr):
     → [if trigger_comments set] scan this PR's comments → Return Versions
 
 In (prlist):
-  Version → prlist.In() → models.GetPullRequest()
+  Version → prlist.In() → Clone Repo → Fetch PR
     → Write Metadata Files → Return Metadata
+  (params.skip_download skips the clone, and writes only pr/url/head_sha —
+   not title/author)
 
 In (pr):
   Version → pr.In() → Clone Repo → Fetch PR 

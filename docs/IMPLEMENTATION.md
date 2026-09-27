@@ -13,14 +13,15 @@ The resource intelligently switches between two modes based on the presence of `
 1. **PR List Mode** (`source.number` absent)
    - Tracks all PRs matching filter criteria
    - Perfect for instance pipelines
-   - Returns PR metadata only (no repo clone)
+   - Clones the repo by default on `get`, same as Single PR Mode (pass `params: {skip_download: true}` for metadata only — see [README#get-in](../README.md#get-in) for other `get` params)
    - Ideal for creating separate pipeline instances per PR
 
 2. **Single PR Mode** (`source.number` present)
    - Tracks commits to a specific PR
    - Full git operations (clone, merge, rebase)
-   - Status updates and comments
    - Ideal for commit-by-commit testing
+
+Status updates and PR comments (`put`) are available in **both modes** — `cmd/out` has no mode dispatch at all; it always runs the same `pr.Out` regardless of `source.number`.
 
 ### Package Structure
 
@@ -33,12 +34,12 @@ github-pr-concourse-resource/
 ├── prlist/             # PR List mode implementation
 │   ├── models.go       # Request/Response types
 │   ├── check.go        # Check logic
-│   └── in.go           # In logic (metadata only)
+│   └── in.go           # In logic (clone by default; skip_download for metadata only)
 ├── pr/                 # Single PR mode implementation
 │   ├── models.go       # Request/Response types
 │   ├── check.go        # Check logic
 │   ├── in.go           # In logic (clone & integrate)
-│   └── out.go          # Out logic (status & comments)
+│   └── out.go          # Out logic (status & comments — shared by both modes; cmd/out has no mode dispatch)
 └── cmd/                # CLI entry points
     ├── check/          # /opt/resource/check
     ├── in/             # /opt/resource/in
@@ -79,16 +80,17 @@ github-pr-concourse-resource/
 - Label filtering
 - Base branch filtering
 - State filtering (OPEN, MERGED, CLOSED)
-- CI skip detection
+- CI skip detection (PR title, not commit messages)
+- Comment triggers (`trigger_comments`) — see [README#comment-triggers](../README.md#comment-triggers)
+- `git_depth` (shallow clone depth on `get`)
+- Status updates and PR comments (`put`) — not gated by mode; `cmd/out` always runs `pr.Out`
 
 ### Single PR Mode Specific
 - Integration tool selection (merge, rebase, checkout)
-- Git depth control
 - Submodule support
-- Git LFS support
-- Changed files listing
-- Status updates
-- PR comments
+- Changed files listing (`list_changed_files`)
+
+> **Note:** `disable_git_lfs` is declared in config but currently unused by the Go code — Git LFS smudging (if any) comes only from `git-lfs` being installed in the resource image, not from this flag.
 
 ## Technical Decisions
 
@@ -102,7 +104,8 @@ github-pr-concourse-resource/
 - Status updates and comments use well-tested REST endpoints
 
 ### 3. Mode Detection
-- Automatically detects mode based on `source.number` presence
+- `check` and `in` automatically detect mode based on `source.number` presence
+- `out` has no mode detection at all — it's the same `pr.Out` implementation for both modes (see `cmd/out/main.go`)
 - No separate resource types needed
 - Single Docker image for both modes
 
@@ -146,10 +149,12 @@ task ci             # Full CI pipeline
 
 ## File Summary
 
-- **17 Go source files** (models, prlist, pr, cmd)
-- **1 test file** with 10 test cases
+Exact counts drift as the codebase grows — check `find . -name '*.go' | wc -l` / `go test ./... -v | grep -c '^--- PASS'` for current numbers rather than trusting the figures below to stay accurate over time.
+
+- **13 Go source files** across `models/`, `prlist/`, `pr/`, `cmd/` (non-test)
+- **6 test files**, 200+ test cases
 - **Comprehensive README** with examples
-- **Taskfile** with 15+ development tasks
+- **Taskfile** with 14 development tasks
 - **CONTRIBUTING guide**
 - **Example pipeline** with 5 jobs
 - **Dockerfile** for container build
@@ -159,9 +164,9 @@ task ci             # Full CI pipeline
 
 - `github.com/google/go-github/v60` - GitHub REST API client
 - `github.com/shurcooL/githubv4` - GitHub GraphQL API client
+- `github.com/golang-jwt/jwt/v5` - JWT signing for GitHub App authentication
 - `golang.org/x/oauth2` - OAuth2 authentication
 - `github.com/stretchr/testify` - Testing utilities
-- `github.com/maxbrunsfeld/counterfeiter/v6` - Mock generation
 
 ## Success Criteria Met
 

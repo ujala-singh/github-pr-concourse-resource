@@ -7,7 +7,7 @@ resource_types:
   - name: github-pr
     type: registry-image
     source:
-      repository: ujala-singh/github-pr-concourse-resource
+      repository: ghcr.io/ujala-singh/github-pr-concourse-resource
       tag: latest
 
 resources:
@@ -61,7 +61,7 @@ jobs:
             type: registry-image
             source:
               repository: golang
-              tag: "1.23"
+              tag: "1.26"
           
           inputs:
             - name: open-prs
@@ -79,8 +79,11 @@ jobs:
                 echo "Author: $PR_AUTHOR"
                 
                 # Your test commands here
-                # Note: In PR List mode, repository is not cloned
-                # This is just metadata
+                # Note: PR list mode clones the repo by default, same as
+                # single-PR mode. Pass params: {skip_download: true} on
+                # this get step to skip the clone — but that path only
+                # writes pr/url/head_sha, not title/author, so drop those
+                # two lines above if you use it.
 
   # Job 2: Full test workflow for specific PR (Single PR Mode)
   - name: test-specific-pr
@@ -105,7 +108,7 @@ jobs:
             type: registry-image
             source:
               repository: golang
-              tag: "1.23"
+              tag: "1.26"
           
           inputs:
             - name: specific-pr
@@ -160,7 +163,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: specific-pr
               params:
@@ -180,7 +183,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.26"}
           inputs:
             - name: specific-pr
           params:
