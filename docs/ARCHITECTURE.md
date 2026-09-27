@@ -122,9 +122,9 @@ In (pr):
   Version → pr.In() → Clone Repo → Fetch PR 
     → Merge/Rebase → Write Metadata → Return Metadata
 
-Out (pr only):
-  Params → pr.Out() → models.UpdateCommitStatus()
-    → models.AddComment() → Return Version
+Out (always pr.Out, both modes — cmd/out has no mode dispatch):
+  Params → pr.Out() → read version.json (recover comment watermark)
+    → models.UpdateCommitStatus() → models.AddComment() → Return Version
 ```
 
 ## Key Design Principles
