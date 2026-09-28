@@ -213,7 +213,7 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `access_token` | No* | - | GitHub personal access token with `repo` scope |
 | `github_app_id` | No* | - | GitHub App ID |
 | `github_app_installation_id` | No* | - | GitHub App Installation ID |
-| `github_app_private_key` | No* | - | GitHub App private key (PEM format) |
+| `github_app_private_key` | No* | - | GitHub App private key. Accepts either a raw PEM string or that same PEM base64-encoded — useful when storing it in a secrets manager or credential store that mangles multi-line values. Validated at config load, so a malformed key fails fast with a clear error instead of surfacing deep inside JWT signing. |
 | `v3_endpoint` | No | `https://api.github.com` | GitHub API v3 endpoint (for GitHub Enterprise) |
 | `v4_endpoint` | No | `https://api.github.com/graphql` | GitHub API v4 endpoint (for GitHub Enterprise) |
 | `hosting_endpoint` | No | `https://github.com` | GitHub hosting endpoint (for GitHub Enterprise) |

@@ -81,6 +81,29 @@ resources:
       github_app_private_key: ((github-app-private-key))
 ```
 
+### Base64-Encoded Private Key
+
+`github_app_private_key` accepts either the raw PEM shown above, or that same PEM base64-encoded. This is useful when a credential store or secrets manager mangles multi-line secrets — collapsing embedded newlines, trimming trailing whitespace, or otherwise not round-tripping a PEM block cleanly. Base64-encoding sidesteps that entirely, since the stored value becomes a single line with no special characters.
+
+Encode the key once:
+
+```bash
+base64 -w0 private-key.pem   # Linux
+base64 -i private-key.pem    # macOS
+```
+
+Then configure it exactly like a raw PEM — no separate flag is needed, the resource detects which form it's given:
+
+```yaml
+source:
+  repository: owner/repo
+  github_app_id: ((github-app-id))
+  github_app_installation_id: ((github-app-installation-id))
+  github_app_private_key: ((github-app-private-key-base64))  # base64-encoded PEM
+```
+
+The resource tries the value as raw PEM first, then as base64-encoded PEM, and validates the result at config load — before any GitHub API calls — so a malformed key fails immediately with a clear error rather than deep inside JWT signing.
+
 ### GitHub Enterprise
 
 For GitHub Enterprise Server, also specify the endpoints:
@@ -139,6 +162,16 @@ This usually means:
 - The Installation ID is incorrect
 - The app isn't installed on the specified repository
 - The app was uninstalled
+
+### "invalid github_app_private_key" / "neither a valid PEM key nor a base64-encoded PEM key" error
+
+The value isn't parseable as either form. Common causes:
+- Copy-paste dropped the `-----BEGIN`/`-----END` header or footer lines
+- The `.pem` file's line endings got mangled (e.g. CRLF from a Windows editor)
+- A base64 value was truncated when stored in a credential manager with a length limit
+- The wrong file was used (e.g. a `.pub` public key instead of the private key)
+
+This is checked at config load — before any GitHub API calls are made — precisely so you see this instead of a less obvious failure later.
 
 ### Token refresh
 

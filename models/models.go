@@ -93,6 +93,9 @@ func (c *CommonConfig) Validate() error {
 		if c.GithubAppPrivateKey == "" {
 			return fmt.Errorf("github_app_private_key must be set when using GitHub App authentication")
 		}
+		if _, err := parseGithubAppPrivateKey(c.GithubAppPrivateKey); err != nil {
+			return fmt.Errorf("invalid github_app_private_key: %w", err)
+		}
 	}
 
 	// Validate repository format

@@ -2,9 +2,12 @@ package models
 
 import (
 	"context"
+	"crypto/rsa"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -12,10 +15,48 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// parseGithubAppPrivateKey accepts github_app_private_key in either of two
+// forms and validates it eagerly rather than letting a bad key surface only
+// once check/in/out actually try to sign a JWT with it:
+//
+//  1. A raw PEM string (the original, still-supported form).
+//  2. That same PEM, base64-encoded — useful when the key is stored in a
+//     secrets manager or credential store that mangles multi-line values
+//     (embedded newlines collapsed, trailing whitespace trimmed, etc.).
+//     Matches the pattern this org's git-app resource type already uses
+//     (base64_github_app_pem in its Secrets Manager payload).
+//
+// It tries the value as raw PEM first, then strips whitespace (so a
+// base64 blob copy-pasted across multiple lines still decodes) and tries
+// again as base64-encoded PEM. Both attempts failing is reported as a
+// single error covering both forms, so a misconfigured key is caught here
+// rather than several calls deep inside JWT signing.
+func parseGithubAppPrivateKey(value string) (*rsa.PrivateKey, error) {
+	trimmed := strings.TrimSpace(value)
+
+	if key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(trimmed)); err == nil {
+		return key, nil
+	}
+
+	cleaned := strings.Join(strings.Fields(trimmed), "")
+	decoded, decodeErr := base64.StdEncoding.DecodeString(cleaned)
+	if decodeErr != nil {
+		return nil, fmt.Errorf("github_app_private_key is neither a valid PEM key nor valid base64 (base64 decode error: %v)", decodeErr)
+	}
+
+	key, err := jwt.ParseRSAPrivateKeyFromPEM(decoded)
+	if err != nil {
+		return nil, fmt.Errorf("github_app_private_key is neither a valid PEM key nor a base64-encoded PEM key: %w", err)
+	}
+
+	return key, nil
+}
+
 // generateGithubAppJWT creates a JWT for GitHub App authentication
 func generateGithubAppJWT(appID string, privateKeyPEM string) (string, error) {
-	// Parse the private key
-	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(privateKeyPEM))
+	// Parse the private key (raw PEM or base64-encoded PEM — see
+	// parseGithubAppPrivateKey)
+	privateKey, err := parseGithubAppPrivateKey(privateKeyPEM)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse private key: %w", err)
 	}

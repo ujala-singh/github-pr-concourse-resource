@@ -597,6 +597,7 @@ If you're still experiencing issues:
 | `API rate limit exceeded` | Too many requests | Use GitHub App or reduce check frequency |
 | `No versions found` | No PRs match filters | Review filter configuration |
 | `failed to clone repository` | Git auth failure | Verify SSH keys or HTTPS token |
+| `invalid github_app_private_key: ...` | Key is neither valid raw PEM nor base64-encoded PEM | See [GitHub App Authentication](GITHUB_APP_AUTHENTICATION.md#invalid-github_app_private_key--neither-a-valid-pem-key-nor-a-base64-encoded-pem-key-error) |
 
 ## Quick Checklist
 
