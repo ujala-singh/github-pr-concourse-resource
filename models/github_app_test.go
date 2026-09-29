@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,17 @@ func TestGenerateGithubAppJWT(t *testing.T) {
 			wantErr:     true,
 			errContains: "failed to parse private key",
 		},
+		{
+			name:       "valid JWT generation with base64-encoded private key",
+			appID:      "12345",
+			privateKey: base64.StdEncoding.EncodeToString([]byte(testPrivateKey)),
+			wantErr:    false,
+			// validateToken is false: the test's own verification step below
+			// re-parses tt.privateKey as raw PEM to derive the public key,
+			// which doesn't know to base64-decode first. The base64 decode
+			// path itself is covered by TestParseGithubAppPrivateKey.
+			validateToken: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -118,6 +130,94 @@ func TestGenerateGithubAppJWT(t *testing.T) {
 	}
 }
 
+func TestParseGithubAppPrivateKey(t *testing.T) {
+	base64Key := base64.StdEncoding.EncodeToString([]byte(testPrivateKey))
+
+	// Simulates a base64 value that got line-wrapped — e.g. by an editor,
+	// a YAML block scalar, or a secrets manager UI — which strings.Fields
+	// must still be able to reassemble before decoding.
+	var wrapped strings.Builder
+	for i := 0; i < len(base64Key); i += 76 {
+		end := min(i+76, len(base64Key))
+		wrapped.WriteString(base64Key[i:end])
+		wrapped.WriteString("\n")
+	}
+	wrappedBase64Key := wrapped.String()
+
+	tests := []struct {
+		name        string
+		value       string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "raw PEM",
+			value:   testPrivateKey,
+			wantErr: false,
+		},
+		{
+			name:    "raw PEM with surrounding whitespace",
+			value:   "\n  " + testPrivateKey + "  \n",
+			wantErr: false,
+		},
+		{
+			name:    "base64-encoded PEM, single line",
+			value:   base64Key,
+			wantErr: false,
+		},
+		{
+			name:    "base64-encoded PEM, wrapped across multiple lines",
+			value:   wrappedBase64Key,
+			wantErr: false,
+		},
+		{
+			name:        "garbage that is neither PEM nor valid base64",
+			value:       "not a key at all!!",
+			wantErr:     true,
+			errContains: "neither a valid PEM key nor valid base64",
+		},
+		{
+			name:        "valid base64 that does not decode to a PEM key",
+			value:       base64.StdEncoding.EncodeToString([]byte("just some random bytes, not a key")),
+			wantErr:     true,
+			errContains: "neither a valid PEM key nor a base64-encoded PEM key",
+		},
+		{
+			// An empty string base64-decodes successfully to zero bytes, so
+			// this fails at the PEM-parse stage, not the base64-decode stage.
+			name:        "empty string",
+			value:       "",
+			wantErr:     true,
+			errContains: "neither a valid PEM key nor a base64-encoded PEM key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, err := parseGithubAppPrivateKey(tt.value)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+				assert.Nil(t, key)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, key)
+
+			// The parsed key must actually be usable: sign and verify a
+			// token with it, not just "parsing didn't error."
+			token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.RegisteredClaims{Issuer: "test"})
+			signed, err := token.SignedString(key)
+			require.NoError(t, err)
+			assert.NotEmpty(t, signed)
+		})
+	}
+}
+
 func TestGetInstallationToken(t *testing.T) {
 	t.Run("successful token retrieval", func(t *testing.T) {
 		// Create mock server
@@ -128,7 +228,7 @@ func TestGetInstallationToken(t *testing.T) {
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
+			_, _ = fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
 		}))
 		defer server.Close()
 
@@ -255,7 +355,7 @@ func TestCommonConfigValidation(t *testing.T) {
 				Repository:              "owner/repo",
 				GithubAppID:             "12345",
 				GithubAppInstallationID: "67890",
-				GithubAppPrivateKey:     "private-key",
+				GithubAppPrivateKey:     testPrivateKey,
 			},
 			wantErr: false,
 		},
@@ -352,7 +452,7 @@ func TestGithubClient_GetAccessToken(t *testing.T) {
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
+			_, _ = fmt.Fprintln(w, `{"token": "ghs_test_installation_token", "expires_at": "2024-12-31T23:59:59Z"}`)
 		}))
 		defer server.Close()
 

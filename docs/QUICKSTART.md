@@ -24,7 +24,7 @@ resource_types:
   - name: github-pr
     type: registry-image
     source:
-      repository: yourusername/github-pr-concourse-resource
+      repository: ghcr.io/ujala-singh/github-pr-concourse-resource
       tag: latest
 ```
 
@@ -240,6 +240,7 @@ jobs:
 2. Verify `check_every` or webhook configuration
 3. Check filters (labels, base_branch, etc.)
 4. Look at Concourse logs: `fly -t target watch -j pipeline/job`
+5. Need to re-run a job without a new commit? See `trigger_comments` in [README.md](../README.md#comment-triggers) instead of pushing an empty commit
 
 ### Git Clone Failing?
 
@@ -253,15 +254,15 @@ jobs:
 
 ## Next Steps
 
-- Read the full [README.md](README.md) for all configuration options
-- Check out [examples/pipeline.yml](examples/pipeline.yml) for more examples
-- See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute
+- Read the full [README.md](../README.md) for all configuration options
+- Check out [examples/pipeline.yml](../examples/pipeline.yml) for more examples
+- See [CONTRIBUTING.md](../CONTRIBUTING.md) to contribute
 
 ## Getting Help
 
-- 📖 Read the full documentation in [README.md](README.md)
-- 🐛 Found a bug? [Open an issue](https://github.com/yourusername/github-pr-concourse-resource/issues)
-- 💬 Have questions? [Start a discussion](https://github.com/yourusername/github-pr-concourse-resource/discussions)
+- 📖 Read the full documentation in [README.md](../README.md)
+- 🐛 Found a bug? [Open an issue](https://github.com/ujala-singh/github-pr-concourse-resource/issues)
+- 💬 Have questions? [Start a discussion](https://github.com/ujala-singh/github-pr-concourse-resource/discussions)
 
 ---
 

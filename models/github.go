@@ -3,6 +3,8 @@ package models
 import (
 	"context"
 	"fmt"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -218,14 +220,27 @@ func (gc *GithubClient) GetChangedFiles(ctx context.Context, number int) ([]stri
 }
 
 // UpdateCommitStatus updates the status of a commit
-func (gc *GithubClient) UpdateCommitStatus(ctx context.Context, sha, state, targetURL, description, context string) error {
+// If targetURL is empty, it automatically generates a Concourse build URL
+func (gc *GithubClient) UpdateCommitStatus(ctx context.Context, sha, state, targetURL, description, baseContext, statusContext string) error {
 	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	// Auto-generate build URL if not provided (matching telia-oss behavior)
+	if targetURL == "" {
+		atcURL := os.Getenv("ATC_EXTERNAL_URL")
+		buildID := os.Getenv("BUILD_ID")
+		if atcURL != "" && buildID != "" {
+			targetURL = strings.Join([]string{atcURL, "builds", buildID}, "/")
+		}
+	}
+
+	// Combine base context and status context (e.g., "concourse-ci/status")
+	fullContext := path.Join(baseContext, statusContext)
 
 	status := &github.RepoStatus{
 		State:       github.String(state),
 		TargetURL:   github.String(targetURL),
 		Description: github.String(description),
-		Context:     github.String(context),
+		Context:     github.String(fullContext),
 	}
 
 	_, _, err := gc.V3.Repositories.CreateStatus(ctx, owner, repo, sha, status)
@@ -250,6 +265,112 @@ func (gc *GithubClient) AddComment(ctx context.Context, number int, body string)
 	}
 
 	return nil
+}
+
+// DeletePreviousComments deletes all previous comments made by the current user on a PR
+func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int) error {
+	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	// Get the current authenticated user
+	var viewerQuery struct {
+		Viewer struct {
+			Login githubv4.String
+		}
+	}
+
+	if err := gc.V4.Query(ctx, &viewerQuery, nil); err != nil {
+		return fmt.Errorf("failed to get viewer: %w", err)
+	}
+
+	currentUserLogin := string(viewerQuery.Viewer.Login)
+
+	// Get all comments on the PR
+	var commentsQuery struct {
+		Repository struct {
+			PullRequest struct {
+				Comments struct {
+					Edges []struct {
+						Node struct {
+							DatabaseId githubv4.Int
+							Author     struct {
+								Login githubv4.String
+							}
+						}
+					}
+				} `graphql:"comments(last: $commentsLast)"`
+			} `graphql:"pullRequest(number: $prNumber)"`
+		} `graphql:"repository(owner: $repositoryOwner, name: $repositoryName)"`
+	}
+
+	variables := map[string]interface{}{
+		"repositoryOwner": githubv4.String(owner),
+		"repositoryName":  githubv4.String(repo),
+		"prNumber":        githubv4.Int(prNumber),
+		"commentsLast":    githubv4.Int(100),
+	}
+
+	if err := gc.V4.Query(ctx, &commentsQuery, variables); err != nil {
+		return fmt.Errorf("failed to query comments: %w", err)
+	}
+
+	// Delete comments made by the current user
+	for _, edge := range commentsQuery.Repository.PullRequest.Comments.Edges {
+		if string(edge.Node.Author.Login) == currentUserLogin {
+			commentID := int64(edge.Node.DatabaseId)
+			_, err := gc.V3.Issues.DeleteComment(ctx, owner, repo, commentID)
+			if err != nil {
+				return fmt.Errorf("failed to delete comment %d: %w", commentID, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// CheckTriggerComments scans PR comments for any that match the given prefixes
+// (case-insensitive). It returns the ID of the latest matching comment (0 if
+// none match) and whether that comment is newer than sinceID (i.e. a new
+// trigger has arrived). Callers are responsible for suppressing the trigger
+// on the first-ever check for a resource (see pr.Check), since sinceID alone
+// cannot distinguish "no baseline yet" from "baseline is legitimately zero".
+func (gc *GithubClient) CheckTriggerComments(ctx context.Context, prNumber int, patterns []string, sinceID int64) (latestMatchID int64, triggered bool, err error) {
+	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+
+	for {
+		comments, resp, err := gc.V3.Issues.ListComments(ctx, owner, repo, prNumber, opts)
+		if err != nil {
+			return 0, false, fmt.Errorf("failed to list PR comments: %w", err)
+		}
+
+		for _, c := range comments {
+			id := c.GetID()
+			body := strings.TrimSpace(c.GetBody())
+			for _, pattern := range patterns {
+				if strings.HasPrefix(strings.ToLower(body), strings.ToLower(strings.TrimSpace(pattern))) {
+					if id > latestMatchID {
+						latestMatchID = id
+					}
+					break
+				}
+			}
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	if latestMatchID == 0 {
+		// No matching comments on this PR at all.
+		return 0, false, nil
+	}
+
+	return latestMatchID, latestMatchID > sinceID, nil
 }
 
 // Helper functions
@@ -339,6 +460,45 @@ func (gc *GithubClient) shouldSkipPR(pr *PullRequest) bool {
 	return false
 }
 
+// matchGlobPath reports whether a slash-separated file path matches a glob
+// pattern. Supports **, *, ?, and [] — where ** matches zero or more path
+// segments (e.g. "foo/**" matches "foo/bar/baz.tf").
+func matchGlobPath(pattern, file string) bool {
+	parts := strings.Split(pattern, "/")
+	segs := strings.Split(file, "/")
+	return matchGlobParts(parts, segs)
+}
+
+func matchGlobParts(pat, name []string) bool {
+	if len(pat) == 0 {
+		return len(name) == 0
+	}
+	if pat[0] == "**" {
+		// ** matches zero or more path segments.
+		for i := 0; i <= len(name); i++ {
+			if matchGlobParts(pat[1:], name[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(name) == 0 {
+		return false
+	}
+	// Delegate single-segment matching to filepath.Match for *, ?, [] support.
+	ok, _ := filepath.Match(pat[0], name[0])
+	return ok && matchGlobParts(pat[1:], name[1:])
+}
+
+// pathMatches reports whether file matches pattern, supporting both glob
+// patterns (with ** for recursive matching) and plain prefix matching.
+func pathMatches(pattern, file string) bool {
+	if strings.ContainsAny(pattern, "*?[") {
+		return matchGlobPath(pattern, file)
+	}
+	return strings.HasPrefix(file, pattern)
+}
+
 // MatchesPathFilters checks if the PR changes match the path filters
 func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest) (bool, error) {
 	// If no path filters, everything matches
@@ -351,27 +511,23 @@ func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest)
 		return false, err
 	}
 
-	// Check ignore paths first
+	// Check ignore paths first: a file is ignored if it matches any ignore pattern.
+	// A PR is included only when at least one changed file is not ignored.
 	if len(gc.Config.IgnorePaths) > 0 {
 		for _, file := range files {
 			ignored := false
 			for _, pattern := range gc.Config.IgnorePaths {
-				// Check if it's a prefix match
-				if strings.HasPrefix(file, pattern) {
-					ignored = true
-					break
-				}
-				// Check if it's a glob pattern
-				if matched, _ := filepath.Match(pattern, file); matched {
+				if pathMatches(pattern, file) {
 					ignored = true
 					break
 				}
 			}
 			if !ignored {
-				// Found at least one file that's not ignored
+				// At least one non-ignored file — proceed to include-path check.
 				if len(gc.Config.Paths) == 0 {
 					return true, nil
 				}
+				break
 			}
 		}
 	}
@@ -380,12 +536,7 @@ func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest)
 	if len(gc.Config.Paths) > 0 {
 		for _, file := range files {
 			for _, pattern := range gc.Config.Paths {
-				// Check if it's a prefix match
-				if strings.HasPrefix(file, pattern) {
-					return true, nil
-				}
-				// Check if it's a glob pattern
-				if matched, _ := filepath.Match(pattern, file); matched {
+				if pathMatches(pattern, file) {
 					return true, nil
 				}
 			}

@@ -250,11 +250,16 @@ func writeMetadataFiles(destDir string, metadata []models.Metadata, version mode
 		}
 	}
 
-	// Write version.json
+	// Write version.json using the same encoding Check/In/Out exchange with
+	// Concourse (see Version.MarshalJSON), so Out can read this file back
+	// and recover fields — like CommentID/CommentBaseline — that aren't
+	// otherwise derivable from the checked-out working directory.
 	versionPath := filepath.Join(resourceDir, "version.json")
-	versionJSON := fmt.Sprintf(`{"pr":"%s","commit":"%s","committed":"%s","approved_review_count":%d}`,
-		version.PR, version.Commit, version.CommittedDate, version.ApprovedReviewCount)
-	if err := os.WriteFile(versionPath, []byte(versionJSON), 0644); err != nil {
+	versionJSON, err := version.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("failed to marshal version.json: %w", err)
+	}
+	if err := os.WriteFile(versionPath, versionJSON, 0644); err != nil {
 		return fmt.Errorf("failed to write version.json: %w", err)
 	}
 
@@ -266,7 +271,7 @@ func writeMetadataFiles(destDir string, metadata []models.Metadata, version mode
 		if i > 0 {
 			metadataJSON.WriteString(",")
 		}
-		metadataJSON.WriteString(fmt.Sprintf(`{"name":"%s","value":"%s"}`, m.Name, m.Value))
+		fmt.Fprintf(&metadataJSON, `{"name":"%s","value":"%s"}`, m.Name, m.Value)
 	}
 	metadataJSON.WriteString("]")
 	if err := os.WriteFile(metadataPath, []byte(metadataJSON.String()), 0644); err != nil {

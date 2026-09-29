@@ -4,33 +4,62 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
+
+// DefaultCheckConcurrency bounds how many PRs are inspected in parallel per
+// check (path filtering, comment scanning) when source.check_concurrency is
+// unset. List mode does one GitHub API call per PR per pass — with many
+// open PRs on the repo, running these sequentially can make a single check
+// take tens of seconds and eat into the GitHub App's rate limit. This
+// trades some of that rate-limit budget for lower per-check latency;
+// raising it further mostly just shifts where the bottleneck is (GitHub's
+// own per-token concurrency/secondary rate limits) — see
+// CommonConfig.CheckConcurrency for the configurable override.
+const DefaultCheckConcurrency = 10
+
+// resolveCheckConcurrency returns the effective concurrency bound for a
+// check: the configured source.check_concurrency if set (validated to be
+// in [1, 50] by CommonConfig.Validate), otherwise DefaultCheckConcurrency.
+func resolveCheckConcurrency(source Source) int {
+	if source.CheckConcurrency > 0 {
+		return source.CheckConcurrency
+	}
+	return DefaultCheckConcurrency
+}
 
 // Check performs the check operation for PR list mode
 // Returns a list of versions representing the current set of PRs
 func Check(request CheckRequest, github *models.GithubClient) ([]models.Version, error) {
 	ctx := context.Background()
+	concurrency := resolveCheckConcurrency(request.Source)
 
 	prs, err := github.GetPullRequests(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pull requests: %w", err)
 	}
 
-	// Filter PRs by path if configured
-	var filteredPRs []*models.PullRequest
-	for _, pr := range prs {
-		matches, err := github.MatchesPathFilters(ctx, pr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to check path filters for PR #%d: %w", pr.Number, err)
-		}
-		if matches {
-			filteredPRs = append(filteredPRs, pr)
-		}
+	filteredPRs, err := filterPRsByPath(ctx, github, prs, concurrency)
+	if err != nil {
+		return nil, err
 	}
 
-	// Convert to versions
+	// Return the current version of every matching PR, every check — not
+	// just whatever comes "after" the last known version's PR in this
+	// list. An earlier version of this function tried to save bandwidth by
+	// only returning entries positioned after the last-known PR's spot in
+	// the freshly fetched list (filterNewVersions, since removed). That
+	// matched purely on PR NUMBER, so once a PR had been seen once, any
+	// later commit pushed to that SAME PR was silently dropped forever —
+	// its entry was always found at "the cursor" and skipped, no matter
+	// how much its Commit/CommittedDate had changed since. Concourse's ATC
+	// already dedups by exact version equality against its own recorded
+	// history, so returning the full snapshot is both simpler and
+	// correct: an unchanged PR's version is a no-op, while a PR with a new
+	// commit (or a brand-new PR) is picked up as new regardless of its
+	// position in the list.
 	var versions []models.Version
 	for _, pr := range filteredPRs {
 		versions = append(versions, models.Version{
@@ -41,38 +70,152 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 		})
 	}
 
-	// If we have a previous version, only return new versions
-	if request.Version != nil {
-		versions = filterNewVersions(versions, *request.Version)
-	}
-
-	// If no new versions, return the current version to indicate no changes
+	// If nothing currently matches (e.g. no open PRs touch the configured
+	// paths), echo back the last known version so the resource doesn't
+	// appear to lose its place.
 	if len(versions) == 0 && request.Version != nil {
 		versions = []models.Version{*request.Version}
+	}
+
+	if len(request.Source.TriggerComments) > 0 {
+		var err error
+		versions, err = applyCommentTriggers(ctx, request, github, filteredPRs, versions, concurrency)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return versions, nil
 }
 
-// filterNewVersions returns only the versions that are newer than the given version
-func filterNewVersions(versions []models.Version, lastVersion models.Version) []models.Version {
-	var newVersions []models.Version
-	foundLast := false
+// runBounded runs fn(i) for i in [0, n) with at most concurrency goroutines
+// in flight at once, and waits for all of them to finish. concurrency <= 0
+// is treated as 1 (no parallelism).
+func runBounded(n int, concurrency int, fn func(i int)) {
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 
-	for _, v := range versions {
-		if v.PR == lastVersion.PR {
-			foundLast = true
-			continue
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+
+	for i := range n {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(i)
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// filterPRsByPath applies source.paths/ignore_paths to each PR concurrently
+// (bounded by concurrency) and returns the matching PRs in the same order
+// GetPullRequests returned them, so downstream cursor-based version diffing
+// stays deterministic regardless of which goroutine finishes first.
+func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*models.PullRequest, concurrency int) ([]*models.PullRequest, error) {
+	matches := make([]bool, len(prs))
+	errs := make([]error, len(prs))
+
+	runBounded(len(prs), concurrency, func(i int) {
+		m, err := github.MatchesPathFilters(ctx, prs[i])
+		matches[i] = m
+		errs[i] = err
+	})
+
+	var filtered []*models.PullRequest
+	for i, pr := range prs {
+		if errs[i] != nil {
+			return nil, fmt.Errorf("failed to check path filters for PR #%d: %w", pr.Number, errs[i])
 		}
-		if foundLast {
-			newVersions = append(newVersions, v)
+		if matches[i] {
+			filtered = append(filtered, pr)
+		}
+	}
+	return filtered, nil
+}
+
+// applyCommentTriggers scans every currently path-matching PR for a comment
+// matching source.trigger_comments and appends an extra version for any PR
+// whose latest matching comment is new since this resource last observed
+// that specific PR.
+//
+// Caveat: unlike single-PR mode, this resource's version stream only
+// remembers a single cursor — the one version Concourse hands back as
+// request.Version — not a per-PR history. Once the cursor advances past a
+// given PR (e.g. because a different PR got a new commit), that PR's
+// comment watermark is lost. A later comment on it is then treated as
+// establishing a fresh baseline (no trigger) rather than firing
+// immediately. This is best-effort: reliable when at most one PR is being
+// actively worked on at a time, but can miss (or, rarely, double-fire) a
+// trigger under heavy concurrent PR churn across many matching PRs.
+func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, filteredPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
+	type result struct {
+		latestMatchID int64
+		triggered     bool
+		err           error
+	}
+	results := make([]result, len(filteredPRs))
+
+	// The GitHub calls (one ListComments per PR) run concurrently; the
+	// version-mutation pass below stays sequential over filteredPRs in its
+	// original order, so the output is deterministic regardless of which
+	// goroutine finishes first.
+	runBounded(len(filteredPRs), concurrency, func(i int) {
+		pr := filteredPRs[i]
+		prKey := strconv.Itoa(pr.Number)
+
+		baselineEstablished := request.Version != nil && request.Version.PR == prKey && request.Version.CommentBaseline
+		var sinceID int64
+		if baselineEstablished {
+			sinceID = request.Version.CommentID
+		}
+
+		latestMatchID, triggered, err := github.CheckTriggerComments(ctx, pr.Number, request.Source.TriggerComments, sinceID)
+		if err != nil {
+			results[i] = result{err: fmt.Errorf("failed to check trigger comments for PR #%d: %w", pr.Number, err)}
+			return
+		}
+		if !baselineEstablished {
+			triggered = false
+		}
+		results[i] = result{latestMatchID: latestMatchID, triggered: triggered}
+	})
+
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
 	}
 
-	// If we didn't find the last version in the list, return all versions
-	if !foundLast {
-		return versions
+	for i, pr := range filteredPRs {
+		prKey := strconv.Itoa(pr.Number)
+		r := results[i]
+
+		// Stamp the watermark on any version already in this batch for this
+		// PR, so the cursor — if it lands here — carries the up-to-date
+		// CommentID forward.
+		for j := range versions {
+			if versions[j].PR == prKey {
+				versions[j].CommentID = r.latestMatchID
+				versions[j].CommentBaseline = true
+			}
+		}
+
+		if r.triggered {
+			versions = append(versions, models.Version{
+				PR:                  prKey,
+				Commit:              pr.HeadRefOID,
+				CommittedDate:       pr.CommittedDate,
+				ApprovedReviewCount: pr.ApprovedReviewCount,
+				CommentID:           r.latestMatchID,
+				CommentBaseline:     true,
+			})
+		}
 	}
 
-	return newVersions
+	return versions, nil
 }
