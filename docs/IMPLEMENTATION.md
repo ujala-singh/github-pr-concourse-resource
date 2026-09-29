@@ -61,7 +61,7 @@ github-pr-concourse-resource/
 ✅ Bounded-concurrency PR list checks (10 in flight by default, configurable via `check_concurrency`) — see [README#concurrency](../README.md#concurrency)
 
 ### Modern Stack
-✅ Go 1.26+
+✅ Go 1.27+
 ✅ Latest GitHub API libraries (go-github v60)
 ✅ Cleaner separation of concerns
 ✅ Better error handling

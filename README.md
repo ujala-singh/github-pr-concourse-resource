@@ -2,7 +2,7 @@
 
 [![CI Status](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/ci.yml/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/ci.yml)
 [![Publish to GHCR](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/publish-ghcr.yml/badge.svg)](https://github.com/ujala-singh/github-pr-concourse-resource/actions/workflows/publish-ghcr.yml)
-[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.27+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io-2088FF?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/pkgs/container/github-pr-concourse-resource)
 [![Attestations](https://img.shields.io/badge/Attestations-SLSA%20Provenance-green?style=flat&logo=github)](https://github.com/ujala-singh/github-pr-concourse-resource/attestations)
@@ -69,7 +69,7 @@ resource_types:
 ### Option 3: Building from Source
 
 **Requirements:**
-- Go 1.26 or higher
+- Go 1.27 or higher
 - Docker (for containerization)
 
 ```bash
@@ -130,7 +130,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: pull-requests
           run:
@@ -481,7 +481,7 @@ jobs:
 ### Building Locally
 
 **Requirements:**
-- Go 1.26 or higher
+- Go 1.27 or higher
 - Docker 24.0 or higher
 - Git 2.40 or higher
 

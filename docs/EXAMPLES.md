@@ -46,7 +46,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26-alpine"}
+            source: {repository: golang, tag: "1.27-alpine"}
           inputs:
             - name: pull-requests
           run:
@@ -214,7 +214,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: feature-pr
           run:
@@ -271,7 +271,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: my-pr
           run:
@@ -284,7 +284,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: my-pr
           run:
@@ -447,7 +447,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: auto-merge-prs
           params:
@@ -503,7 +503,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.26"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: my-pr
           run:
