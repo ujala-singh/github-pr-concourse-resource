@@ -296,7 +296,7 @@ These are local `git merge`/`git rebase` failures inside the `get` step, not a G
      type: registry-image
      source:
        repository: golang
-       tag: "1.26"  # Match your local version
+       tag: "1.27"  # Match your local version
    ```
 
 2. **Missing dependencies**:
