@@ -5,14 +5,14 @@ Thank you for your interest in contributing! This document provides guidelines a
 ## Development Setup
 
 1. **Prerequisites**
-   - Go 1.23 or higher
+   - Go 1.27 or higher
    - Docker 24.0 or higher (for building images)
    - [Task](https://taskfile.dev/) (optional, for using Taskfile)
    - [golangci-lint](https://golangci-lint.run/) (for code linting)
 
 2. **Clone and Setup**
    ```bash
-   git clone https://github.com/yourusername/github-pr-concourse-resource.git
+   git clone https://github.com/ujala-singh/github-pr-concourse-resource.git
    cd github-pr-concourse-resource
    go mod download
    ```

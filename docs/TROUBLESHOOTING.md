@@ -133,8 +133,8 @@ resources:
     source:
       repository: myorg/myrepo
       access_token: ((github-token))
-      skip_drafts: true        # Are your PRs drafts?
-      skip_forks: true          # Are PRs from forks?
+      ignore_drafts: true       # Are your PRs drafts?
+      disable_forks: true       # Are PRs from forks?
       base_branch: main         # Is PR targeting different branch?
       required_review_approvals: 1  # Does PR have approval?
       labels: ["ready"]         # Does PR have the label?
@@ -177,17 +177,16 @@ gh pr view 123 --json files -q '.files[].path'
 # Verify against your patterns
 ```
 
-#### 5. Commit Has [ci skip]
+#### 5. PR Title Has [ci skip]
+
+This check looks at the **PR title**, not individual commit messages. By default (`disable_ci_skip: false`), a PR is skipped if its title contains either marker:
 
 ```yaml
-# If skip_ci_skip is true (default), commits with these are ignored:
 # - [ci skip]
 # - [skip ci]
-# - [skip-ci]
-# - [ci-skip]
 ```
 
-Remove the marker from commit message or set `skip_ci_skip: false`.
+Rename the PR (remove the marker from its title), or set `disable_ci_skip: true` to turn this check off entirely.
 
 ### Problem: Only One PR Triggers, Not All
 
@@ -241,37 +240,50 @@ sh: can't open 'my-script.sh': No such file or directory
    git update-index --chmod=+x my-script.sh
    ```
 
-### Problem: Merge Conflict During Rebase
+### Problem: Merge Conflict During Merge/Rebase
+
+Integration (merge/rebase/checkout of the PR into the base branch) happens on the **`get`** step, via the `integration_tool` param — there is no such param on `put`; `put` only updates status and posts comments.
 
 **Symptoms:**
 ```
-ERROR: failed to rebase: merge conflicts detected
+task failed / get step failed
+failed to merge PR: exit status 1
 ```
+or
+```
+failed to rebase PR: exit status 1
+```
+
+These are local `git merge`/`git rebase` failures inside the `get` step, not a GitHub API error — a real conflict between the PR branch and its base means the `get` step itself fails, so nothing downstream in that build runs.
 
 **Solutions:**
 
-1. **Don't auto-rebase**: Let developer resolve conflicts manually
-2. **Add comment notification**:
+1. **Use `integration_tool: checkout`** to skip merging entirely and just check out the PR branch as-is — useful when you only need to test the branch in isolation, not "as merged":
    ```yaml
-   - put: my-pr
+   - get: my-pr
+     trigger: true
      params:
-       path: my-pr
-       rebase: true
-     on_failure:
-       put: my-pr
-       params:
-         path: my-pr
-         comment: "⚠️ Automatic rebase failed. Please rebase manually."
+       integration_tool: checkout
    ```
 
-3. **Use merge instead of rebase** for automatic integration:
+2. **Notify on failure** — since the `get` step failing means the whole build fails before any task runs, use a job-level `on_failure` (not on the `get` step itself) to post a status/comment via `put`:
    ```yaml
-   - put: my-pr
+   plan:
+     - get: my-pr
+       trigger: true
+       params:
+         integration_tool: rebase
+     - task: test
+       # ...
+   on_failure:
+     put: my-pr
      params:
        path: my-pr
-       merge:
-         method: merge
+       status: failure
+       comment: "⚠️ Build failed — if this was a rebase conflict, please rebase manually and re-push."
    ```
+
+3. **Have the developer resolve conflicts on the PR branch itself** — this resource can't resolve conflicts for you; it only performs the same merge/rebase a developer would run locally.
 
 ### Problem: Tests Fail in CI but Pass Locally
 
@@ -284,7 +296,7 @@ ERROR: failed to rebase: merge conflicts detected
      type: registry-image
      source:
        repository: golang
-       tag: "1.23"  # Match your local version
+       tag: "1.27"  # Match your local version
    ```
 
 2. **Missing dependencies**:
@@ -346,7 +358,7 @@ resource check duration: 2m30s
        check_every: 5m  # Default is 1m
    ```
 
-4. **Use GitHub App**: Better rate limits (5,000 vs 5,000 requests/hour)
+4. **Use GitHub App**: Better rate limits (5,000 vs 60 requests/hour)
 
 ### Problem: Too Many Builds Triggered
 
@@ -354,13 +366,10 @@ resource check duration: 2m30s
 
 1. **Skip draft PRs**:
    ```yaml
-   skip_drafts: true
+   ignore_drafts: true
    ```
 
-2. **Skip commits with [ci skip]**:
-   ```yaml
-   skip_ci_skip: true  # Default: true
-   ```
+2. **Skip PRs with [ci skip] in the title**: already on by default (`disable_ci_skip: false`) — check you haven't set `disable_ci_skip: true` somewhere.
 
 3. **Use labels for opt-in**:
    ```yaml
@@ -410,6 +419,34 @@ resource check duration: 2m30s
        status: failure
    ```
 
+### Problem: Status Check "Details" Link Points to Wrong Hostname
+
+**Symptoms:**
+
+The link attached to a GitHub commit status check opens a URL on the wrong host — for example, `concourse.example.com` instead of `concourse.proxy.example.com` — resulting in an access-denied or unreachable page.
+
+**Cause:**
+
+Concourse injects `ATC_EXTERNAL_URL` into every build from its `externalUrl` Helm value. This value may be locked to a hostname that differs from the one users actually reach builds through (e.g. when `externalUrl` is tied to an STS WebIdentity OIDC issuer, or when builds are accessed via a Teleport proxy under a different domain).
+
+**Solution:**
+
+Set `concourse_url` in the resource source to the public URL users should be sent to:
+
+```yaml
+resources:
+  - name: pull-request
+    type: github-pr
+    source:
+      repository: owner/repo
+      github_app_id: ((github-app-id))
+      github_app_installation_id: ((github-app-installation-id))
+      github_app_private_key: ((github-app-private-key))
+      concourse_url: "https://concourse.proxy.example.com"
+```
+
+`concourse_url` overrides `ATC_EXTERNAL_URL` at the start of the `put` step, so both explicit `target_url` expansions and the auto-generated build URL (`$ATC_EXTERNAL_URL/builds/$BUILD_ID`) use the correct hostname.
+
 ### Problem: Comments Not Appearing
 
 **Solutions:**
@@ -430,33 +467,6 @@ resource check duration: 2m30s
    ```bash
    # Check Concourse logs
    fly -t target watch --job pipeline/job-name
-   ```
-
-### Problem: Merge Fails
-
-**Symptoms:**
-```
-ERROR: failed to merge: PUT https://api.github.com/repos/owner/repo/pulls/123/merge: 405 Method not allowed
-```
-
-**Solutions:**
-
-1. **Check branch protection**:
-   - Repository Settings → Branches → Branch protection rules
-   - Ensure required checks are passing
-   - Verify required reviews are approved
-
-2. **Verify merge is not blocked**:
-   - Check for merge conflicts
-   - Verify PR is not from a protected branch
-   - Check that PR has required approvals
-
-3. **Use correct merge method**:
-   ```yaml
-   params:
-     path: my-pr
-     merge:
-       method: squash  # or merge, rebase
    ```
 
 ## Debugging Tips
@@ -484,9 +494,9 @@ config:
         ls -laR .git/resource/  # Show resource metadata
         cat .git/resource/pr
         cat .git/resource/url
-        cat .git/resource/head_name
+        cat .git/resource/head_ref
         cat .git/resource/head_sha
-        cat .git/resource/base_name
+        cat .git/resource/base_ref
         cat .git/resource/base_sha
 ```
 
@@ -498,9 +508,9 @@ Resource provides metadata files in `.git/resource/`:
 cd pull-requests
 cat .git/resource/pr              # PR number
 cat .git/resource/url             # PR URL
-cat .git/resource/head_name       # Branch name
+cat .git/resource/head_ref       # Branch name
 cat .git/resource/head_sha        # Commit SHA
-cat .git/resource/base_name       # Base branch
+cat .git/resource/base_ref       # Base branch
 cat .git/resource/base_sha        # Base commit SHA
 cat .git/resource/changed_files   # List of changed files (newline-separated)
 ```
@@ -587,6 +597,7 @@ If you're still experiencing issues:
 | `API rate limit exceeded` | Too many requests | Use GitHub App or reduce check frequency |
 | `No versions found` | No PRs match filters | Review filter configuration |
 | `failed to clone repository` | Git auth failure | Verify SSH keys or HTTPS token |
+| `invalid github_app_private_key: ...` | Key is neither valid raw PEM nor base64-encoded PEM | See [GitHub App Authentication](GITHUB_APP_AUTHENTICATION.md#invalid-github_app_private_key--neither-a-valid-pem-key-nor-a-base64-encoded-pem-key-error) |
 
 ## Quick Checklist
 
@@ -599,7 +610,7 @@ When troubleshooting, verify:
 - [ ] Using `version: every` for PR list mode
 - [ ] Resource inputs match resource names
 - [ ] Status context is set when updating status
-- [ ] Token has permission for actions (merge, comment, status)
+- [ ] Token has permission for actions (comment, status, cloning/merging locally)
 - [ ] No rate limiting issues
 - [ ] Concourse can reach api.github.com
 

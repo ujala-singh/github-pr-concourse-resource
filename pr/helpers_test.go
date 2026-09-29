@@ -187,9 +187,9 @@ func TestOutParams_CommentConfiguration(t *testing.T) {
 		{
 			name: "delete previous comments",
 			params: OutParams{
-				Path:          "pr",
-				Comment:       "New comment",
-				DeleteComment: "true",
+				Path:                   "pr",
+				Comment:                "New comment",
+				DeletePreviousComments: true,
 			},
 			description: "should delete previous comments before adding new one",
 		},

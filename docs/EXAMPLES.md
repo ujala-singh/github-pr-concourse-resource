@@ -11,6 +11,7 @@ Comprehensive examples for common CI/CD scenarios.
 - [Advanced Filtering](#advanced-filtering)
 - [Integration Examples](#integration-examples)
 - [Security Patterns](#security-patterns)
+- [Comment-Triggered Runs](#comment-triggered-runs)
 
 ## PR List Mode Examples
 
@@ -45,7 +46,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23-alpine"}
+            source: {repository: golang, tag: "1.27-alpine"}
           inputs:
             - name: pull-requests
           run:
@@ -106,9 +107,10 @@ resources:
     source:
       repository: myorg/myrepo
       access_token: ((github-token))
-      skip_drafts: true
-      skip_forks: true
-      skip_ci_skip: true
+      ignore_drafts: true
+      disable_forks: true
+      # Commits with [ci skip]/[skip ci] in the PR title are already
+      # excluded by default (disable_ci_skip: false); no field needed here.
       required_review_approvals: 1
       labels: ["ready-for-ci"]
 
@@ -212,7 +214,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: feature-pr
           run:
@@ -269,7 +271,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: my-pr
           run:
@@ -282,7 +284,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: my-pr
           run:
@@ -320,7 +322,7 @@ resources:
       repository: myorg/myrepo
       access_token: ((github-token))
       labels: ["hotfix", "urgent"]
-      skip_drafts: true
+      ignore_drafts: true
 
   - name: feature-prs
     type: github-pr
@@ -375,8 +377,8 @@ resources:
       repository: myorg/myrepo
       access_token: ((github-token))
       required_review_approvals: 2
-      skip_drafts: true
-      skip_forks: true
+      ignore_drafts: true
+      disable_forks: true
       states: [OPEN]
 
 jobs:
@@ -414,7 +416,7 @@ jobs:
 
 ### Example 9: Merge After Successful Tests
 
-Automatically merge PRs that pass all checks:
+This resource has no `put` parameter that merges a PR on GitHub — `put` only updates commit status and posts comments (see [`put` (out)](../README.md#put-out) params). Actually merging still has to go through GitHub's own API, typically via the `gh` CLI, using the same token:
 
 ```yaml
 resources:
@@ -425,7 +427,7 @@ resources:
       access_token: ((github-token))
       labels: ["automerge"]
       required_review_approvals: 1
-      skip_drafts: true
+      ignore_drafts: true
 
 jobs:
   - name: test-and-merge
@@ -440,36 +442,44 @@ jobs:
           status: pending
           comment: "Running automated tests before merge..."
       
-      - task: test
+      - task: test-and-merge
         config:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: auto-merge-prs
+          params:
+            GITHUB_TOKEN: ((github-token))
           run:
             path: sh
             args:
               - -c
               - |
+                apk add --no-cache github-cli || (apt-get update && apt-get install -y gh)
                 cd auto-merge-prs
                 go test ./...
                 go vet ./...
+                PR=$(cat .git/resource/pr)
+                gh pr merge "$PR" --squash --repo myorg/myrepo
       
-      - put: auto-merge-prs
+      on_success:
+        put: auto-merge-prs
         params:
           path: auto-merge-prs
-          merge:
-            method: squash
-            commit_msg: "file"
-          comment: "✅ Tests passed. Merging PR..."
+          comment: "✅ Tests passed. PR merged."
           status: success
+      on_failure:
+        put: auto-merge-prs
+        params:
+          path: auto-merge-prs
+          status: failure
 ```
 
 ### Example 10: Rebase and Test
 
-Keep PR up-to-date with base branch:
+Keeping a PR up-to-date with its base branch happens on `get`, via `integration_tool: rebase` — not on `put`, which has no rebase parameter:
 
 ```yaml
 resources:
@@ -485,21 +495,15 @@ jobs:
     plan:
       - get: my-pr
         trigger: true
-      
-      # Rebase on base branch
-      - put: my-pr
         params:
-          path: my-pr
-          rebase: true
-          comment: "🔄 Rebased on latest base branch"
+          integration_tool: rebase
       
-      # Test after rebase
       - task: test
         config:
           platform: linux
           image_resource:
             type: registry-image
-            source: {repository: golang, tag: "1.23"}
+            source: {repository: golang, tag: "1.27"}
           inputs:
             - name: my-pr
           run:
@@ -511,7 +515,17 @@ jobs:
         params:
           path: my-pr
           status: success
-          comment: "✅ Tests passed after rebase"
+          comment: "✅ Tests passed after rebasing on the base branch"
+      on_failure:
+        put: my-pr
+        params:
+          path: my-pr
+          status: failure
+          # If the rebase itself failed (conflicts), the get step never
+          # succeeded, so this only covers a genuine test failure. A
+          # conflicting rebase surfaces as the get step failing outright —
+          # see Troubleshooting: "Merge Conflict During Rebase/Merge".
+          comment: "❌ Tests failed after rebasing on the base branch"
 ```
 
 ## Security Patterns
@@ -529,7 +543,7 @@ resources:
       github_app_id: ((github-app-id))
       github_app_installation_id: ((github-app-installation-id))
       github_app_private_key: ((github-app-private-key))
-      skip_forks: true  # Security: don't run on forks
+      disable_forks: true  # Security: don't run on forks
 
 jobs:
   - name: secure-test
@@ -550,7 +564,7 @@ resources:
     source:
       repository: myorg/public-repo
       access_token: ((public-repo-token))  # Token with minimal scopes
-      skip_forks: false  # Allow community PRs
+      disable_forks: false  # Allow community PRs
 
   - name: private-repo-prs
     type: github-pr
@@ -559,7 +573,7 @@ resources:
       github_app_id: ((private-app-id))
       github_app_installation_id: ((private-installation-id))
       github_app_private_key: ((private-app-key))
-      skip_forks: true  # Require trusted contributors
+      disable_forks: true  # Require trusted contributors
       required_review_approvals: 2
 ```
 
@@ -576,7 +590,7 @@ resources:
         - "docs/**"
         - "*.md"
       # Only allow documentation changes from forks
-      skip_forks: false
+      disable_forks: false
 
 jobs:
   - name: test-docs-pr
@@ -606,6 +620,51 @@ jobs:
                   exit 1
                 fi
 ```
+
+## Comment-Triggered Runs
+
+### Example 14: Re-run a Terraform Plan from a PR Comment
+
+Use `trigger_comments` to re-run a job from a PR comment (e.g. `concourse plan`) instead of requiring a new commit — useful for re-running a plan after an unrelated infra failure, or after approving/merging a base branch change that should be re-planned against.
+
+```yaml
+resources:
+  - name: pull-request
+    type: github-pr
+    source:
+      repository: owner/repo
+      github_app_id: ((github-app-id))
+      github_app_installation_id: ((github-app-installation-id))
+      github_app_private_key: ((github-app-private-key))
+      paths:
+        - terraform/**
+      trigger_comments:
+        - "concourse plan"
+
+jobs:
+  - name: pr-plan
+    plan:
+      - get: pull-request
+        trigger: true
+      - task: terraform-plan
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: {repository: hashicorp/terraform, tag: "latest"}
+          inputs:
+            - name: pull-request
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                cd pull-request/terraform
+                terraform init
+                terraform plan
+```
+
+Commenting `concourse plan` on the PR causes the next check to pick up a new version for the PR's current HEAD, re-running `pr-plan` without a new commit. See [Comment Triggers](../README.md#comment-triggers) in the README for the single-PR-vs-list-mode reliability tradeoff.
 
 ## Best Practices
 
