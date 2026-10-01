@@ -32,11 +32,22 @@ func write(t *testing.T, dir, rel, body string) {
 	}
 }
 
+// isolateGitConfig hides the developer's global/system git config (e.g.
+// user.name/email) from the code under test, so tests behave like a resource
+// container, which has none. Test setup commits pass their own identity.
+func isolateGitConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 // originWithPR builds a bare repo shaped like GitHub's: branch main, plus
 // refs/pull/1/head for a PR that changes a.txt. After the PR branched, main
 // moved on (b.txt), so the base tip is NOT an ancestor of the PR head.
 func originWithPR(t *testing.T) (originURL, baseTip, prHead string) {
 	t.Helper()
+	isolateGitConfig(t)
 	root := t.TempDir()
 	origin, dev := filepath.Join(root, "origin.git"), filepath.Join(root, "dev")
 	git(t, root, "init", "-q", "--bare", "-b", "main", origin)
@@ -112,7 +123,9 @@ func TestCheckoutPRWritesNothingToStdout(t *testing.T) {
 	os.Stdout = w
 	_, _, cerr := checkoutPR(url, "main", 1, prHead, InParams{IntegrationTool: "merge"}, filepath.Join(t.TempDir(), "pr"))
 	os.Stdout = orig
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 	captured, _ := io.ReadAll(r)
 	if cerr != nil {
 		t.Fatal(cerr)

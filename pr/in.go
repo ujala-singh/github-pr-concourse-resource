@@ -225,8 +225,15 @@ func getCommitSHA(repoDir, ref string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// gitIdentity is the committer for the commits merge/rebase create locally.
+// Resource containers have no git user configured, and `git merge --no-ff`
+// (always) and `git rebase` (when replaying commits) refuse to commit without
+// one. These commits never leave the build's checkout.
+var gitIdentity = []string{"-c", "user.name=Concourse CI", "-c", "user.email=concourse-ci@users.noreply.github.com"}
+
 func mergePR(repoDir, sha string) error {
-	cmd := exec.Command("git", "merge", "--no-ff", sha, "-m", fmt.Sprintf("Merge PR commit %s", sha))
+	args := append(append([]string{}, gitIdentity...), "merge", "--no-ff", sha, "-m", fmt.Sprintf("Merge PR commit %s", sha))
+	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
 	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
@@ -234,7 +241,8 @@ func mergePR(repoDir, sha string) error {
 }
 
 func rebasePR(repoDir, sha string) error {
-	cmd := exec.Command("git", "rebase", sha)
+	args := append(append([]string{}, gitIdentity...), "rebase", sha)
+	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
 	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
