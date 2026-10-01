@@ -172,7 +172,7 @@ func cloneRepo(repoURL, branch, destination string, depth int) error {
 	args = append(args, "--no-tags", repoURL, destination)
 
 	cmd := exec.Command("git", args...)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -180,7 +180,7 @@ func cloneRepo(repoURL, branch, destination string, depth int) error {
 func fetchPR(repoDir string, prNumber int) error {
 	cmd := exec.Command("git", "fetch", "origin", fmt.Sprintf("pull/%d/head", prNumber))
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -188,7 +188,7 @@ func fetchPR(repoDir string, prNumber int) error {
 func checkoutCommit(repoDir, sha string) error {
 	cmd := exec.Command("git", "checkout", "-q", sha)
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }

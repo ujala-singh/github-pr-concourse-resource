@@ -340,7 +340,7 @@ The resource provides metadata in multiple formats:
    - `head_ref` - Head branch name
    - `head_sha` - Head commit SHA
    - `base_ref` - Base branch name
-   - `base_sha` - Base commit SHA (Single PR mode only)
+   - `base_sha` - Base branch tip the PR was integrated onto, captured before the PR is checked out (Single PR mode only). Diff `$(git merge-base base_sha head_sha)..head_sha` for the PR's own changes
    - `state` - PR state
    - `approved_review_count` - Number of approvals
 
