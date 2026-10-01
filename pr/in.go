@@ -44,55 +44,12 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 		return InResponse{}, fmt.Errorf("failed to get access token: %w", err)
 	}
 
-	// Clone the base branch
 	owner, repo := github.Config.GetOwnerAndRepo()
 	repoURL := buildRepoURL(github.Config, owner, repo, accessToken)
 
-	if err := cloneRepo(repoURL, pr.BaseRefName, destinationDir, request.Params.GitDepth, request.Params.FetchTags); err != nil {
-		return InResponse{}, fmt.Errorf("failed to clone repository: %w", err)
-	}
-
-	// Fetch the PR
-	if err := fetchPR(destinationDir, prNumber); err != nil {
-		return InResponse{}, fmt.Errorf("failed to fetch PR: %w", err)
-	}
-
-	// Checkout the specific commit
-	if err := checkoutCommit(destinationDir, request.Version.Commit); err != nil {
-		return InResponse{}, fmt.Errorf("failed to checkout commit: %w", err)
-	}
-
-	// Get the base SHA before integration
-	baseSHA, err := getCommitSHA(destinationDir, "HEAD")
+	baseSHA, integrationTool, err := checkoutPR(repoURL, pr.BaseRefName, prNumber, request.Version.Commit, request.Params, destinationDir)
 	if err != nil {
-		return InResponse{}, fmt.Errorf("failed to get base SHA: %w", err)
-	}
-
-	// Integrate the PR based on the integration tool
-	integrationTool := request.Params.IntegrationTool
-	if integrationTool == "" {
-		integrationTool = "merge"
-	}
-
-	if integrationTool != "checkout" {
-		// Checkout the base branch first
-		if err := checkoutBranch(destinationDir, pr.BaseRefName); err != nil {
-			return InResponse{}, fmt.Errorf("failed to checkout base branch: %w", err)
-		}
-
-		// Perform the integration
-		switch integrationTool {
-		case "merge":
-			if err := mergePR(destinationDir, request.Version.Commit); err != nil {
-				return InResponse{}, fmt.Errorf("failed to merge PR: %w", err)
-			}
-		case "rebase":
-			if err := rebasePR(destinationDir, request.Version.Commit); err != nil {
-				return InResponse{}, fmt.Errorf("failed to rebase PR: %w", err)
-			}
-		default:
-			return InResponse{}, fmt.Errorf("invalid integration_tool: %s (must be merge, rebase, or checkout)", integrationTool)
-		}
+		return InResponse{}, err
 	}
 
 	// Handle submodules
@@ -148,6 +105,62 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 
 // Git helper functions
 
+// checkoutPR clones baseRef into destinationDir, fetches the PR, and leaves
+// the working tree integrated according to params.IntegrationTool (merge by
+// default, rebase, or checkout of the PR head alone).
+//
+// It returns the base branch tip it cloned (the base_sha metadata) and the
+// integration tool used. The base tip is recorded right after the clone,
+// before the PR head is checked out: reading HEAD any later would return the
+// PR head, not the base.
+func checkoutPR(repoURL, baseRef string, prNumber int, headSHA string, params InParams, destinationDir string) (baseSHA, integrationTool string, err error) {
+	integrationTool = params.IntegrationTool
+	if integrationTool == "" {
+		integrationTool = "merge"
+	}
+	switch integrationTool {
+	case "merge", "rebase", "checkout":
+	default:
+		return "", "", fmt.Errorf("invalid integration_tool: %s (must be merge, rebase, or checkout)", integrationTool)
+	}
+
+	if err := cloneRepo(repoURL, baseRef, destinationDir, params.GitDepth, params.FetchTags); err != nil {
+		return "", "", fmt.Errorf("failed to clone repository: %w", err)
+	}
+
+	baseSHA, err = getCommitSHA(destinationDir, "HEAD")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get base SHA: %w", err)
+	}
+
+	if err := fetchPR(destinationDir, prNumber); err != nil {
+		return "", "", fmt.Errorf("failed to fetch PR: %w", err)
+	}
+
+	if err := checkoutCommit(destinationDir, headSHA); err != nil {
+		return "", "", fmt.Errorf("failed to checkout commit: %w", err)
+	}
+
+	if integrationTool == "checkout" {
+		return baseSHA, integrationTool, nil
+	}
+
+	if err := checkoutBranch(destinationDir, baseRef); err != nil {
+		return "", "", fmt.Errorf("failed to checkout base branch: %w", err)
+	}
+	switch integrationTool {
+	case "merge":
+		if err := mergePR(destinationDir, headSHA); err != nil {
+			return "", "", fmt.Errorf("failed to merge PR: %w", err)
+		}
+	case "rebase":
+		if err := rebasePR(destinationDir, headSHA); err != nil {
+			return "", "", fmt.Errorf("failed to rebase PR: %w", err)
+		}
+	}
+	return baseSHA, integrationTool, nil
+}
+
 func buildRepoURL(config models.CommonConfig, owner, repo, token string) string {
 	if config.HostingEndpoint != "" {
 		return fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git",
@@ -173,7 +186,7 @@ func cloneRepo(repoURL, branch, destination string, depth int, fetchTags bool) e
 	args = append(args, repoURL, destination)
 
 	cmd := exec.Command("git", args...)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -181,7 +194,7 @@ func cloneRepo(repoURL, branch, destination string, depth int, fetchTags bool) e
 func fetchPR(repoDir string, prNumber int) error {
 	cmd := exec.Command("git", "fetch", "origin", fmt.Sprintf("pull/%d/head", prNumber))
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -189,7 +202,7 @@ func fetchPR(repoDir string, prNumber int) error {
 func checkoutCommit(repoDir, sha string) error {
 	cmd := exec.Command("git", "checkout", "-q", sha)
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -197,7 +210,7 @@ func checkoutCommit(repoDir, sha string) error {
 func checkoutBranch(repoDir, branch string) error {
 	cmd := exec.Command("git", "checkout", "-B", branch, "origin/"+branch)
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -215,7 +228,7 @@ func getCommitSHA(repoDir, ref string) (string, error) {
 func mergePR(repoDir, sha string) error {
 	cmd := exec.Command("git", "merge", "--no-ff", sha, "-m", fmt.Sprintf("Merge PR commit %s", sha))
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -223,7 +236,7 @@ func mergePR(repoDir, sha string) error {
 func rebasePR(repoDir, sha string) error {
 	cmd := exec.Command("git", "rebase", sha)
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -231,7 +244,7 @@ func rebasePR(repoDir, sha string) error {
 func updateSubmodules(repoDir string) error {
 	cmd := exec.Command("git", "submodule", "update", "--init", "--recursive")
 	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = os.Stderr // stdout is reserved for the JSON response
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
