@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -289,6 +291,65 @@ func TestGithubAppTokenSource(t *testing.T) {
 		// This should trigger a refresh attempt (will fail without real credentials)
 		_, err = ts.Token()
 		assert.Error(t, err) // Expected to fail without real GitHub App
+	})
+
+	// Regression test: a previous version of Token() read and wrote
+	// ts.token/ts.expiresAt with no synchronization. In the real call
+	// graph, oauth2.NewClient's own mutex-protected reuseTokenSource
+	// happens to serialize every call, so this was never triggered in
+	// production — but it's a real data race in this type's own Token()
+	// method per the oauth2.TokenSource contract, confirmed by `go test
+	// -race` before mu was added here. This test calls Token() directly,
+	// bypassing that external protection, specifically to prove this type
+	// is safe on its own terms now.
+	t.Run("concurrent Token calls under -race", func(t *testing.T) {
+		var mintCount atomic.Int32
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/v3/app/installations/67890/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+			mintCount.Add(1)
+			// Hold the response just long enough that, without mu,
+			// concurrent callers would all see an empty/expired token and
+			// race on refreshing it simultaneously.
+			time.Sleep(5 * time.Millisecond)
+			_, _ = fmt.Fprint(w, `{"token": "ghs_test_token", "expires_at": "2099-12-31T23:59:59Z"}`)
+		})
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		config := CommonConfig{
+			Repository:              "owner/repo",
+			GithubAppID:             "12345",
+			GithubAppInstallationID: "67890",
+			GithubAppPrivateKey:     testPrivateKey,
+			V3Endpoint:              server.URL,
+		}
+		ts := &githubAppTokenSource{ctx: context.Background(), config: config}
+
+		const n = 50
+		var wg sync.WaitGroup
+		errs := make([]error, n)
+		for i := range n {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, err := ts.Token()
+				errs[i] = err
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("Token() call %d failed: %v", i, err)
+			}
+		}
+
+		// The whole point of locking across the refresh (not just around
+		// the field reads/writes) is that concurrent callers piggyback on
+		// one in-flight refresh instead of each minting their own token.
+		if got := mintCount.Load(); got != 1 {
+			t.Errorf("underlying token mint endpoint called %d times for %d concurrent Token() calls, want exactly 1 (thundering herd)", got, n)
+		}
 	})
 }
 

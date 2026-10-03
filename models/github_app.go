@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -131,22 +132,40 @@ func getGithubAppToken(ctx context.Context, config CommonConfig, httpClient *htt
 	return installationToken, nil
 }
 
-// githubAppTokenSource implements oauth2.TokenSource for GitHub App authentication
+// githubAppTokenSource implements oauth2.TokenSource for GitHub App
+// authentication. oauth2.NewClient wraps whatever TokenSource it's given in
+// its own mutex-protected reuseTokenSource before handing back an
+// http.Client — and models.NewGithubClient is the only place this type gets
+// constructed, always immediately passed into oauth2.NewClient — so in
+// today's call graph, Token() is never actually invoked concurrently. But
+// the oauth2.TokenSource interface itself documents that implementations
+// must tolerate concurrent calls, and that external protection is an
+// implementation detail of a different package, not something this type can
+// rely on holding forever. mu makes it correct on its own terms.
 type githubAppTokenSource struct {
 	ctx        context.Context
 	config     CommonConfig
 	httpClient *http.Client
-	token      string
-	expiresAt  time.Time
+
+	mu        sync.Mutex
+	token     string
+	expiresAt time.Time
 }
 
 func (ts *githubAppTokenSource) Token() (*oauth2.Token, error) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
 	// Check if we need to refresh the token (refresh 5 minutes before expiry)
 	if ts.token != "" && time.Now().Before(ts.expiresAt.Add(-5*time.Minute)) {
 		return &oauth2.Token{AccessToken: ts.token}, nil
 	}
 
-	// Get a new installation token
+	// Get a new installation token. Holding mu across this network call is
+	// deliberate: it also fixes a thundering-herd problem where N
+	// concurrent callers hitting an expired token would otherwise each mint
+	// their own fresh installation token instead of N-1 of them simply
+	// waiting for the first refresh and reusing its result.
 	token, err := getGithubAppToken(ts.ctx, ts.config, ts.httpClient)
 	if err != nil {
 		return nil, err
