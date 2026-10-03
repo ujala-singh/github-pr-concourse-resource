@@ -266,6 +266,8 @@ Commenting `concourse plan` (case-insensitive, prefix match) on the PR causes th
 
 In both modes, the very first `trigger_comments`-eligible check for a PR (or the first check after upgrading to a version of this resource that supports it) only establishes the watermark — it won't retroactively fire on comments that already existed before the pipeline started watching for them.
 
+**Comment triggers are independent of `paths`/`ignore_paths` matching on the latest push.** Once a PR has an established comment-trigger watermark, a matching comment fires regardless of whether the PR's most recent commit happens to touch a configured path — a comment isn't a push, and there's no reason a manual "please re-plan" request should depend on what the latest commit touched. (An earlier version of this resource got this wrong: once [path filtering was scoped to the diff since the last build](#path-filtering-and-diff-scope) instead of the PR's full history, a PR whose latest commit didn't touch a matching path could permanently stop being eligible for comment triggers too, since nothing else ever advances a stale cursor forward. Fixed — comment-trigger eligibility for the resource's tracked PR no longer depends on the commit-triggering path match.)
+
 ## Behavior
 
 ### `check` 

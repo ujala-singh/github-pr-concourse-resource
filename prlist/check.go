@@ -78,8 +78,39 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	}
 
 	if len(request.Source.TriggerComments) > 0 {
+		// filteredPRs is scoped to "did the latest push touch a matching
+		// path" (see filterPRsByPath), which is the right question for
+		// commit-triggering but the wrong one for comment-triggering: a
+		// "concourse plan" comment isn't a push, and a human posting one
+		// has no reason to expect it to depend on what the PR's most
+		// recent commit happened to touch. Without this, the resource's
+		// own cursor PR could fall out of filteredPRs (push touched an
+		// unrelated path) and, since nothing else ever advances that
+		// cursor, trigger_comments would go permanently dead for that PR
+		// — exactly what was reported. So the cursor PR is always
+		// eligible for the comment scan, even when path-filtered out of
+		// the commit-triggering set.
+		commentScopePRs := filteredPRs
+		if request.Version != nil {
+			alreadyIncluded := false
+			for _, pr := range filteredPRs {
+				if strconv.Itoa(pr.Number) == request.Version.PR {
+					alreadyIncluded = true
+					break
+				}
+			}
+			if !alreadyIncluded {
+				for _, pr := range prs {
+					if strconv.Itoa(pr.Number) == request.Version.PR {
+						commentScopePRs = append(append([]*models.PullRequest(nil), filteredPRs...), pr)
+						break
+					}
+				}
+			}
+		}
+
 		var err error
-		versions, err = applyCommentTriggers(ctx, request, github, filteredPRs, versions, concurrency)
+		versions, err = applyCommentTriggers(ctx, request, github, commentScopePRs, versions, concurrency)
 		if err != nil {
 			return nil, err
 		}
