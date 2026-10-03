@@ -601,3 +601,92 @@ func TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck(t *testing.T) 
 		t.Errorf("versions[0].Commit = %s, want %s (old commit) — a version for the new commit would retrigger the build even though it didn't touch the configured path", versions[0].Commit, oldSHA)
 	}
 }
+
+// TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths is the
+// single-PR-mode counterpart to prlist's regression test of the same name,
+// reproducing a real production incident on PR #5 of
+// dbt-labs/dbt-concourse-config. A commit landed touching only the
+// pipeline's own bootstrap YAML (outside source.paths), followed by a
+// genuine "concourse plan" comment — and the comment trigger never fired.
+//
+// Root cause here: when the path-filter check for a new, non-matching
+// commit failed to match, Check returned early, skipping the
+// comment-trigger section entirely for that check. Since the early return
+// echoed back the unchanged last-known version, the next check's `since`
+// (derived from that version's CommittedDate) stayed exactly the same, so
+// the same non-matching commit kept being discovered as "new" and kept
+// triggering the same early return — permanently, on every future check,
+// regardless of any comment posted afterward.
+func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testing.T) {
+	const prNumber = 5
+	const oldSHA = "9a1bfa3cfa2bfa18544879af4c637275c7d1292a" // last build (matched paths)
+	const newSHA = "c2d150b4de4a56eef0866b3e5cfc3a27b551022f" // bootstrap-yaml-only push (doesn't)
+	const oldCommentID = 0
+	const newCommentID = 5971991589
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, singlePRGraphQLResponse(prNumber, newSHA))
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/commits", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"sha": %q, "commit": {"committer": {"date": "2026-10-03T17:55:53Z"}}}]`, newSHA)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/compare/%s...%s", oldSHA, newSHA), func(w http.ResponseWriter, r *http.Request) {
+		// The latest push only touched the bootstrap YAML, outside paths.
+		_, _ = fmt.Fprint(w, `{"files": [{"filename": "concourse-config-bootstrap-staging.yaml"}]}`)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}]`, newCommentID)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(nil)
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository:      "owner/repo",
+			Paths:           []string{"environments/staging/**", "modules/**", "pipelines/staging/**"},
+			TriggerComments: []string{"concourse plan"},
+		},
+	}
+
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config, Number: prNumber},
+		Version: &models.Version{
+			PR:              strconv.Itoa(prNumber),
+			Commit:          oldSHA,
+			CommittedDate:   "2026-10-03T15:59:18Z",
+			CommentID:       oldCommentID,
+			CommentBaseline: true,
+		},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var triggered *models.Version
+	for i := range versions {
+		if versions[i].PR == strconv.Itoa(prNumber) && versions[i].CommentID == newCommentID {
+			triggered = &versions[i]
+		}
+	}
+	if triggered == nil {
+		t.Fatalf("no version with the new comment's ID was emitted — the comment trigger did not fire: %+v", versions)
+	}
+	if triggered.Commit != newSHA {
+		t.Errorf("triggered version Commit = %s, want %s (current HEAD)", triggered.Commit, newSHA)
+	}
+	if !triggered.CommentBaseline {
+		t.Errorf("triggered version CommentBaseline = false, want true")
+	}
+}

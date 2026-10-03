@@ -53,10 +53,17 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 			return nil, fmt.Errorf("failed to check path filters: %w", err)
 		}
 		if !matches {
-			if !firstRun {
-				return []models.Version{*request.Version}, nil
-			}
-			return []models.Version{}, nil
+			// Suppress commit-based versions, but — unlike an early
+			// return — keep going into the comment-trigger check below.
+			// A path mismatch on the latest push says nothing about
+			// whether a human just asked for a re-plan via comment; an
+			// early return here used to skip that check entirely,
+			// permanently breaking trigger_comments for any PR whose
+			// current HEAD doesn't happen to touch a matching path,
+			// since nothing afterward would ever update the stored
+			// version/since-date to let a later check see things
+			// differently.
+			prs = nil
 		}
 	}
 
