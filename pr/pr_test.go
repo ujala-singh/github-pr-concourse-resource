@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
+	"github.com/google/go-github/v60/github"
 	"github.com/shurcooL/githubv4"
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
@@ -520,5 +523,81 @@ func TestOut_PropagatesCommentWatermarkFromVersionJSON(t *testing.T) {
 	}
 	if !response.Version.CommentBaseline {
 		t.Errorf("Version.CommentBaseline = false, want true (dropped the triggering version's watermark)")
+	}
+}
+
+// TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck is the
+// single-PR-mode counterpart to prlist's end-to-end regression test of
+// the same name: a PR whose cumulative base...HEAD diff includes a
+// path-matching file from an earlier, already-built commit must not keep
+// matching forever once its latest push only touches unrelated files.
+// Single PR mode always has a reliable last-known commit (there's no
+// cursor-sharing limitation here, unlike list mode), so this is fully
+// fixed, not just best-effort. pulls/{number}/files (the cumulative-diff
+// endpoint) must never be hit once a previous commit is known.
+func TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck(t *testing.T) {
+	const prNumber = 40
+	const oldSHA = "f17cb0bc598907938993ec4ff7e4691333b93123"
+	const newSHA = "8228e7b92bafa2009649cbebf613a42d475febf0"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, singlePRGraphQLResponse(prNumber, newSHA))
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/commits", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"sha": %q, "commit": {"committer": {"date": "2026-01-02T00:00:00Z"}}}]`, newSHA)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("pulls/%d/files (cumulative diff) must not be called when a previous commit is known", prNumber)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/compare/%s...%s", oldSHA, newSHA), func(w http.ResponseWriter, r *http.Request) {
+		// Only the latest push's own change — nothing under
+		// concourse-demo-setup/terraform/**, unlike the PR's full history.
+		_, _ = fmt.Fprint(w, `{"files": [
+			{"filename": "concourse-demo-setup/pipelines/GCP/teleport-ssh-agent.yaml"}
+		]}`)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(nil)
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository: "owner/repo",
+			Paths:      []string{"concourse-demo-setup/terraform/**"},
+		},
+	}
+
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config, Number: prNumber},
+		Version: &models.Version{
+			PR:            strconv.Itoa(prNumber),
+			Commit:        oldSHA,
+			CommittedDate: "2026-01-01T00:00:00Z",
+		},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// No match means Check echoes back the last known version rather than
+	// an empty list — but it must be byte-identical to request.Version
+	// (the old commit), not the new one, so Concourse doesn't register it
+	// as new and retrigger the build.
+	if len(versions) != 1 {
+		t.Fatalf("got %d versions, want exactly 1 (the echoed-back last known version): %+v", len(versions), versions)
+	}
+	if versions[0].Commit != oldSHA {
+		t.Errorf("versions[0].Commit = %s, want %s (old commit) — a version for the new commit would retrigger the build even though it didn't touch the configured path", versions[0].Commit, oldSHA)
 	}
 }

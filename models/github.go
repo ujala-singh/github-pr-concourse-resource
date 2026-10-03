@@ -219,6 +219,39 @@ func (gc *GithubClient) GetChangedFiles(ctx context.Context, number int) ([]stri
 	return allFiles, nil
 }
 
+// GetChangedFilesSince returns the files changed between baseSHA and
+// headSHA (exclusive of baseSHA, inclusive of headSHA) using GitHub's
+// compare-two-commits API. Unlike GetChangedFiles — which always reflects
+// a PR's entire base-branch...HEAD diff, regardless of which commit you're
+// asking about — this answers "what changed between these two specific
+// commits," which is what's needed to tell whether a new push touched
+// matching paths, rather than whether the PR has ever, cumulatively,
+// touched them.
+func (gc *GithubClient) GetChangedFilesSince(ctx context.Context, baseSHA, headSHA string) ([]string, error) {
+	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	var allFiles []string
+	opts := &github.ListOptions{PerPage: 100}
+
+	for {
+		comparison, resp, err := gc.V3.Repositories.CompareCommits(ctx, owner, repo, baseSHA, headSHA, opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compare commits %s...%s: %w", baseSHA, headSHA, err)
+		}
+
+		for _, file := range comparison.Files {
+			allFiles = append(allFiles, file.GetFilename())
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allFiles, nil
+}
+
 // UpdateCommitStatus updates the status of a commit
 // If targetURL is empty, it automatically generates a Concourse build URL
 func (gc *GithubClient) UpdateCommitStatus(ctx context.Context, sha, state, targetURL, description, baseContext, statusContext string) error {
@@ -499,24 +532,58 @@ func pathMatches(pattern, file string) bool {
 	return strings.HasPrefix(file, pattern)
 }
 
-// MatchesPathFilters checks if the PR changes match the path filters
-func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest) (bool, error) {
+// MatchesPathFilters checks whether pr's relevant changed files match
+// source.paths/ignore_paths.
+//
+// sinceSHA, when non-empty, is the last commit this resource previously
+// recorded a version for on this exact PR. Passing it scopes the check to
+// files changed between sinceSHA and the PR's current HEAD (via
+// GetChangedFilesSince) — correctly answering "did the latest push change
+// matching paths" rather than "has this PR, across its entire history,
+// ever touched matching paths." That second, broader question is what
+// GetChangedFiles always answers (GitHub's pulls/{number}/files endpoint
+// returns the PR's full base...HEAD diff regardless of which commit is
+// being checked) — it's used here only when sinceSHA is empty, which is
+// the only option for a PR with no previously-known commit to diff from
+// (e.g. appearing for the first time).
+//
+// If sinceSHA already equals pr.HeadRefOID, nothing has changed since the
+// last check, so this returns false without an API call.
+func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest, sinceSHA string) (bool, error) {
 	// If no path filters, everything matches
 	if len(gc.Config.Paths) == 0 && len(gc.Config.IgnorePaths) == 0 {
 		return true, nil
 	}
 
-	files, err := gc.GetChangedFiles(ctx, pr.Number)
+	if sinceSHA != "" && sinceSHA == pr.HeadRefOID {
+		return false, nil
+	}
+
+	var files []string
+	var err error
+	if sinceSHA != "" {
+		files, err = gc.GetChangedFilesSince(ctx, sinceSHA, pr.HeadRefOID)
+	} else {
+		files, err = gc.GetChangedFiles(ctx, pr.Number)
+	}
 	if err != nil {
 		return false, err
 	}
 
+	return filesMatchPathFilters(gc.Config, files), nil
+}
+
+// filesMatchPathFilters applies source.paths/ignore_paths to an already-
+// fetched list of changed files. Pulled out of MatchesPathFilters so the
+// matching logic itself — as opposed to which files it's given — can be
+// tested without any GitHub API involved.
+func filesMatchPathFilters(config CommonConfig, files []string) bool {
 	// Check ignore paths first: a file is ignored if it matches any ignore pattern.
 	// A PR is included only when at least one changed file is not ignored.
-	if len(gc.Config.IgnorePaths) > 0 {
+	if len(config.IgnorePaths) > 0 {
 		for _, file := range files {
 			ignored := false
-			for _, pattern := range gc.Config.IgnorePaths {
+			for _, pattern := range config.IgnorePaths {
 				if pathMatches(pattern, file) {
 					ignored = true
 					break
@@ -524,8 +591,8 @@ func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest)
 			}
 			if !ignored {
 				// At least one non-ignored file — proceed to include-path check.
-				if len(gc.Config.Paths) == 0 {
-					return true, nil
+				if len(config.Paths) == 0 {
+					return true
 				}
 				break
 			}
@@ -533,16 +600,16 @@ func (gc *GithubClient) MatchesPathFilters(ctx context.Context, pr *PullRequest)
 	}
 
 	// Check include paths
-	if len(gc.Config.Paths) > 0 {
+	if len(config.Paths) > 0 {
 		for _, file := range files {
-			for _, pattern := range gc.Config.Paths {
+			for _, pattern := range config.Paths {
 				if pathMatches(pattern, file) {
-					return true, nil
+					return true
 				}
 			}
 		}
-		return false, nil
+		return false
 	}
 
-	return true, nil
+	return true
 }

@@ -282,7 +282,7 @@ func TestFilterPRsByPath_PreservesInputOrder(t *testing.T) {
 		{Number: 1}, {Number: 2}, {Number: 3}, {Number: 4}, {Number: 5},
 	}
 
-	filtered, err := filterPRsByPath(context.Background(), gc, prs, DefaultCheckConcurrency)
+	filtered, err := filterPRsByPath(context.Background(), gc, prs, DefaultCheckConcurrency, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestFilterPRsByPath_PropagatesErrorFromAnyWorker(t *testing.T) {
 
 	prs := []*models.PullRequest{{Number: 1}, {Number: 2}, {Number: 3}}
 
-	_, err := filterPRsByPath(context.Background(), gc, prs, DefaultCheckConcurrency)
+	_, err := filterPRsByPath(context.Background(), gc, prs, DefaultCheckConcurrency, nil)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -555,6 +555,80 @@ func TestCheck_NewCommitOnAlreadyTrackedPR_IsDetected(t *testing.T) {
 	}
 	if versions[0].Commit != newSHA {
 		t.Errorf("versions[0].Commit = %s, want %s (new commit was dropped — the bug is back)", versions[0].Commit, newSHA)
+	}
+}
+
+// TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck is an
+// end-to-end regression test for the reported bug: a PR whose cumulative
+// base...HEAD diff includes a path-matching file (from an earlier,
+// already-built commit) kept matching forever, even once its latest push
+// touched only unrelated files. For the PR this resource already has a
+// last-known commit for (the cursor), Check must now diff from that
+// commit instead of using the PR's full history — so this PR, despite its
+// earlier terraform change, correctly stops matching once the latest push
+// is unrelated. It also asserts pulls/{number}/files (the cumulative-diff
+// endpoint) is never hit in this case — if it were, the old bug's root
+// cause would still be reachable regardless of what the compare endpoint
+// returns.
+func TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck(t *testing.T) {
+	const prNumber = 40
+	const oldSHA = "f17cb0bc598907938993ec4ff7e4691333b93123"
+	const newSHA = "8228e7b92bafa2009649cbebf613a42d475febf0"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, pullRequestsGraphQLResponse(prNumber, newSHA))
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("pulls/%d/files (cumulative diff) must not be called for an already-tracked PR", prNumber)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/compare/%s...%s", oldSHA, newSHA), func(w http.ResponseWriter, r *http.Request) {
+		// Only the latest push's own change — nothing under
+		// concourse-demo-setup/terraform/**, unlike the PR's full history.
+		_, _ = fmt.Fprint(w, `{"files": [
+			{"filename": "concourse-demo-setup/pipelines/GCP/teleport-ssh-agent.yaml"}
+		]}`)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(nil)
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository: "owner/repo",
+			Paths:      []string{"concourse-demo-setup/terraform/**"},
+		},
+	}
+
+	request := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: &models.Version{PR: strconv.Itoa(prNumber), Commit: oldSHA},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// With no currently-matching PRs, Check echoes back the last known
+	// version rather than returning an empty list — but critically, that
+	// echoed version must be byte-identical to request.Version (same old
+	// commit), not the new commit. Concourse only triggers a build on a
+	// version it hasn't already recorded, so this proves no retrigger
+	// fires for a push that didn't touch the configured path.
+	if len(versions) != 1 {
+		t.Fatalf("got %d versions, want exactly 1 (the echoed-back last known version): %+v", len(versions), versions)
+	}
+	if versions[0].Commit != oldSHA {
+		t.Errorf("versions[0].Commit = %s, want %s (old commit) — a version for the new commit would retrigger the build even though it didn't touch the configured path", versions[0].Commit, oldSHA)
 	}
 }
 

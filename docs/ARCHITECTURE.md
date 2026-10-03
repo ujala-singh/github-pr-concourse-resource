@@ -114,13 +114,18 @@ cmd/out has no mode dispatch (see diagram above).
 
 Check (prlist):
   User Config → prlist.Check() → models.GetPullRequests()
-    → GitHub GraphQL → Filter PRs by path (concurrent, bounded pool)
+    → GitHub GraphQL → Filter PRs by path (concurrent, bounded pool;
+      diffs from the last known commit when this PR IS the resource's
+      tracked cursor, else falls back to the PR's full base...HEAD diff
+      — see MatchesPathFilters)
     → [if trigger_comments set] scan each matching PR's comments
       (concurrent, bounded pool) → Return Versions
 
 Check (pr):
   User Config → pr.Check() → models.GetPullRequestCommits()
-    → GitHub REST → Filter Commits
+    → GitHub REST → Filter Commits (diffs from the last known commit —
+      always available in this mode — to the new HEAD, via
+      MatchesPathFilters / GetChangedFilesSince)
     → [if trigger_comments set] scan this PR's comments → Return Versions
 
 In (prlist):
