@@ -252,6 +252,20 @@ type Version struct {
 	// been established at least once. Until then, CommentID == 0 is
 	// ambiguous (never checked vs. checked-and-found-nothing).
 	CommentBaseline bool `json:"-"`
+	// CommentWatermarks is prlist mode's per-PR comment-trigger watermark
+	// table: PR number (as a string) -> highest matching comment ID seen
+	// for that PR. CommentID/CommentBaseline above only ever describe the
+	// one PR this specific version is about; this map is how watermarks
+	// for OTHER PRs survive the single-cursor limitation of Concourse's
+	// check protocol (it only ever hands back the one version it
+	// considers "latest" — there's no API to ask for "the version you
+	// last recorded for PR #20" specifically). By stamping the full,
+	// current map onto every version prlist.Check emits, whichever one
+	// Concourse remembers next carries every tracked PR's watermark
+	// forward, not just the PR that version happens to be about. Nil/empty
+	// when trigger_comments is unset, or in single-PR mode (which has no
+	// "other PRs" to track and uses CommentID/CommentBaseline directly).
+	CommentWatermarks map[string]int64 `json:"-"`
 }
 
 // MarshalJSON encodes the version as map[string]string, as required by the
@@ -274,6 +288,19 @@ func (v Version) MarshalJSON() ([]byte, error) {
 	}
 	if v.CommentBaseline {
 		m["comment_baseline"] = "true"
+	}
+	if len(v.CommentWatermarks) > 0 {
+		// encoding/json sorts map[string]T keys lexicographically, so this
+		// is deterministic for a given map's contents — essential here:
+		// if the same watermarks produced different byte strings across
+		// checks, every other version carrying this field would look
+		// "new" to Concourse's ATC every time, spuriously retriggering
+		// jobs for commits that didn't actually change.
+		watermarksJSON, err := json.Marshal(v.CommentWatermarks)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal comment_watermarks: %w", err)
+		}
+		m["comment_watermarks"] = string(watermarksJSON)
 	}
 	return json.Marshal(m)
 }
@@ -305,6 +332,14 @@ func (v *Version) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("invalid comment_id %q: %w", s, err)
 		}
 		v.CommentID = n
+	}
+
+	if s, ok := m["comment_watermarks"]; ok && s != "" {
+		var watermarks map[string]int64
+		if err := json.Unmarshal([]byte(s), &watermarks); err != nil {
+			return fmt.Errorf("invalid comment_watermarks %q: %w", s, err)
+		}
+		v.CommentWatermarks = watermarks
 	}
 
 	return nil

@@ -333,7 +333,7 @@ func TestApplyCommentTriggers_FirstObservation_EstablishesBaselineWithoutFiring(
 		Version: nil, // no prior version at all — this PR has never been observed
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 		Version: prevVersion,
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.
 		Version: prevVersion,
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -452,7 +452,7 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		Version: &models.Version{PR: strconv.Itoa(cursorPR), CommentID: 100, CommentBaseline: true},
 	}
 
-	versions, err := applyCommentTriggers(context.Background(), request, gc, prs, preExisting, DefaultCheckConcurrency)
+	versions, err := applyCommentTriggers(context.Background(), request, gc, prs, prs, preExisting, DefaultCheckConcurrency)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -839,5 +839,108 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 	}
 	if !triggered.CommentBaseline {
 		t.Errorf("triggered version CommentBaseline = false, want true")
+	}
+}
+
+// TestCheck_CommentWatermarks_SurviveCursorMovingToADifferentPR is the core
+// regression test for the single-cursor limitation itself: before
+// CommentWatermarks, this resource could only remember a comment-trigger
+// baseline for whichever PR happened to be request.Version.PR — the one
+// version Concourse hands back as "latest." The moment a different PR
+// became the cursor (e.g. it got a new commit), every other PR's
+// watermark was gone for good; a later comment on it would look exactly
+// like a PR that had never been checked before, re-establishing a fresh
+// baseline instead of firing.
+//
+// Here, PR #20 is the cursor (request.Version.PR == "20"), but PR #5 still
+// has an established watermark (id 100) in CommentWatermarks from an
+// earlier check. PR #5 gets a new matching comment. It must fire — not
+// get silently re-baselined — proving the watermark survived the cursor
+// moving away from it.
+func TestCheck_CommentWatermarks_SurviveCursorMovingToADifferentPR(t *testing.T) {
+	const prA = 5
+	const prASHA = "aaa111"
+	const oldCommentID = 100
+	const newCommentID = 200
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		// Only PR #5 is currently open/matching — PR #20 (the stale
+		// cursor) is gone (closed/merged), so its watermark entry should
+		// also be pruned from the output.
+		_, _ = fmt.Fprint(w, pullRequestsGraphQLResponse(prA, prASHA))
+	})
+	// PR #5's changed files deliberately don't match source.paths, so it's
+	// excluded from the commit-triggering set (filteredPRs). Without this,
+	// an empty Paths config would make PR #5 trivially "match" on its own,
+	// and the stamping that already happens for ordinary commit-matching
+	// PRs would set CommentID regardless of whether the comment trigger
+	// itself actually fired — masking exactly the bug this test exists to
+	// catch. The only path left for a PR #5 version to appear is the
+	// explicit "triggered" append inside applyCommentTriggers.
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", prA), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"filename": "unrelated/file.txt"}]`)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", prA), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, oldCommentID, newCommentID)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(nil)
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository:      "owner/repo",
+			Paths:           []string{"relevant/**"},
+			TriggerComments: []string{"concourse plan"},
+		},
+	}
+
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR:              "20", // a different PR is the cursor
+			Commit:          "zzz999",
+			CommentBaseline: true,
+			CommentWatermarks: map[string]int64{
+				"5":  oldCommentID, // PR A's watermark, NOT the cursor
+				"20": 999,          // the stale cursor's own watermark
+			},
+		},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var triggered *models.Version
+	for i := range versions {
+		if versions[i].PR == strconv.Itoa(prA) && versions[i].CommentID == newCommentID {
+			triggered = &versions[i]
+		}
+	}
+	if triggered == nil {
+		t.Fatalf("PR #%d's comment trigger did not fire even though its watermark was established — the single-cursor limitation is back: %+v", prA, versions)
+	}
+	if triggered.Commit != prASHA {
+		t.Errorf("triggered version Commit = %s, want %s", triggered.Commit, prASHA)
+	}
+
+	// PR #20 is gone (not in the current open-PR list), so its entry must
+	// be pruned rather than carried forward forever.
+	if _, stillPresent := triggered.CommentWatermarks["20"]; stillPresent {
+		t.Errorf("CommentWatermarks still has an entry for closed/gone PR #20, want it pruned: %+v", triggered.CommentWatermarks)
+	}
+	if got := triggered.CommentWatermarks["5"]; got != newCommentID {
+		t.Errorf("CommentWatermarks[\"5\"] = %d, want %d (the fresh result, not the stale %d)", got, newCommentID, oldCommentID)
 	}
 }
