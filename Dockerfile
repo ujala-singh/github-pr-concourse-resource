@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /assets/check ./c
     CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /assets/in ./cmd/in && \
     CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /assets/out ./cmd/out
 
-FROM alpine:latest
+FROM alpine:3.24
 
 RUN apk add --no-cache git openssh-client ca-certificates git-lfs bash
 
