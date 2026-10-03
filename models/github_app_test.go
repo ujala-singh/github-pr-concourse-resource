@@ -256,12 +256,33 @@ func TestGetInstallationToken(t *testing.T) {
 
 func TestGithubAppTokenSource(t *testing.T) {
 	t.Run("token caching logic", func(t *testing.T) {
-		// Create a mock config
+		// Mock server that always rejects the installation-token mint, so
+		// Token() fails fast and deterministically. This test previously
+		// had no V3Endpoint set at all, which meant it silently depended
+		// on a REAL network call to api.github.com failing fast with a
+		// bad-credentials error. That held up under light/isolated test
+		// runs, but a dedicated stress run (go test -race -cpu=1,2,4,8
+		// -count=100) caught it hanging for the full 10-minute default
+		// test timeout instead of failing — almost certainly GitHub's
+		// real API responding very differently (or not at all, within
+		// the window) under the kind of heavy concurrent outbound-request
+		// load many parallel `go test` processes produce at once. A test
+		// should never depend on an external network's behavior to pass
+		// reliably; this makes the failure local and instant instead.
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"message": "Bad credentials"}`)
+		})
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
 		config := CommonConfig{
 			Repository:              "owner/repo",
 			GithubAppID:             "12345",
 			GithubAppInstallationID: "67890",
 			GithubAppPrivateKey:     testPrivateKey,
+			V3Endpoint:              server.URL,
 		}
 
 		ts := &githubAppTokenSource{
@@ -269,10 +290,10 @@ func TestGithubAppTokenSource(t *testing.T) {
 			config: config,
 		}
 
-		// First call should attempt to generate a new token
-		// This will fail because we don't have a real GitHub App, but we can test the caching logic
+		// First call should attempt to generate a new token and fail
+		// against the mock's 401 — fast and deterministic, no real
+		// GitHub App credentials or network reachability required.
 		_, err := ts.Token()
-		// Expected to fail without real GitHub App credentials
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to get installation token")
 
@@ -288,9 +309,10 @@ func TestGithubAppTokenSource(t *testing.T) {
 		// Simulate token near expiry
 		ts.expiresAt = time.Now().Add(4 * time.Minute)
 
-		// This should trigger a refresh attempt (will fail without real credentials)
+		// This should trigger a refresh attempt against the mock, which
+		// also rejects it.
 		_, err = ts.Token()
-		assert.Error(t, err) // Expected to fail without real GitHub App
+		assert.Error(t, err)
 	})
 
 	// Regression test: a previous version of Token() read and wrote
@@ -364,18 +386,15 @@ func TestNewGithubClientWithGithubApp(t *testing.T) {
 
 		githubConfig := GithubConfig{}
 
+		// NewGithubClient only builds the client — it never eagerly calls
+		// Token(), so it never makes a network call and never fails here
+		// just because the credentials aren't real; that only happens
+		// later, lazily, on the first actual API request.
 		client, err := NewGithubClient(config, githubConfig)
-
-		// Note: This will fail without a real GitHub App, but we can verify structure
-		// In a real scenario, you'd mock the GitHub API
-		if err != nil {
-			// Expected to fail without real credentials, but verify it tried to use GitHub App
-			assert.Contains(t, err.Error(), "installation token", "Should attempt GitHub App authentication")
-		} else {
-			require.NotNil(t, client)
-			assert.NotNil(t, client.V3)
-			assert.NotNil(t, client.V4)
-		}
+		require.NoError(t, err)
+		require.NotNil(t, client)
+		assert.NotNil(t, client.V3)
+		assert.NotNil(t, client.V4)
 	})
 
 	t.Run("creates client with access token", func(t *testing.T) {

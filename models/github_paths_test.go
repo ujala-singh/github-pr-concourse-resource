@@ -21,7 +21,18 @@ func newTestGithubClientForPaths(t *testing.T, mux *http.ServeMux, config Common
 		t.Fatalf("failed to parse test server URL: %v", err)
 	}
 
-	v3 := github.NewClient(nil)
+	// A dedicated *http.Transport, not github.NewClient(nil) (which leaves
+	// Transport nil and falls back to the shared, process-wide
+	// http.DefaultTransport). Under heavy repeated runs, a stale keep-alive
+	// connection to a PREVIOUS, already-closed httptest.Server can get
+	// reused if a later server happens to bind the same recycled ephemeral
+	// port, hanging forever waiting for a response that will never come.
+	// Confirmed via a dedicated stress run (go test -race -count=100
+	// -cpu=1,2,4,8): a test using the shared-default-transport pattern
+	// hung for the full test timeout instead of completing in ms. A fresh
+	// Transport per client gives each test its own isolated connection
+	// pool.
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	v3.BaseURL = baseURL
 
 	config.Repository = "owner/repo"
