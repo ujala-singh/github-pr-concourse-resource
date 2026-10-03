@@ -33,7 +33,22 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	}
 
 	if len(prs) > 0 {
-		matches, err := github.MatchesPathFilters(ctx, prs[0])
+		// prs is ordered oldest-new-commit-first; the last entry is the
+		// PR's current HEAD. Diffing from the last known commit
+		// (request.Version.Commit) to that HEAD — rather than using the
+		// PR's full base...HEAD diff, which GetChangedFiles always
+		// returns regardless of which commit is asked about — correctly
+		// answers "did this push change matching paths," so a PR doesn't
+		// keep matching forever just because some earlier, already-built
+		// commit happened to touch a relevant path. On the very first
+		// check (firstRun), there's no prior commit to diff from, so this
+		// falls back to the full-PR diff via an empty sinceSHA.
+		latest := prs[len(prs)-1]
+		var sinceSHA string
+		if !firstRun {
+			sinceSHA = request.Version.Commit
+		}
+		matches, err := github.MatchesPathFilters(ctx, latest, sinceSHA)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check path filters: %w", err)
 		}

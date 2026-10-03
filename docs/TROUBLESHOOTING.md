@@ -177,6 +177,15 @@ gh pr view 123 --json files -q '.files[].path'
 # Verify against your patterns
 ```
 
+Note: `gh pr view --json files` shows the PR's **entire** base...HEAD diff, same as GitHub's UI "Files changed" tab. That's not necessarily what this resource is comparing against for an already-tracked PR — see [Path Filtering and Diff Scope](../README.md#path-filtering-and-diff-scope): the resource diffs from the *last build's commit*, not the PR's full history, whenever it has one to diff from. To see exactly what a specific push changed, diff two commits directly instead:
+```bash
+gh api repos/OWNER/REPO/compare/OLD_SHA...NEW_SHA -q '.files[].filename'
+```
+
+#### 4b. PR Keeps Matching Even Though the Latest Push Looks Unrelated
+
+If `paths` still matches on a push that clearly didn't touch a relevant file, check whether an *earlier* commit in the same PR did. In PR List Mode, this can still happen for a PR the resource has no previously-known commit for — a PR appearing for the first time, or one Concourse's single version cursor has moved away from (see the [Comment Triggers](../README.md#comment-triggers) cursor caveat, which applies to path filtering the same way). In that case there's nothing to diff from, so the check falls back to the PR's full history — same as every PR did before this was fixed. Single PR Mode doesn't have this gap; it always diffs from its last build.
+
 #### 5. PR Title Has [ci skip]
 
 This check looks at the **PR title**, not individual commit messages. By default (`disable_ci_skip: false`), a PR is skipped if its title contains either marker:

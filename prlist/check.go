@@ -41,7 +41,7 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 		return nil, fmt.Errorf("failed to get pull requests: %w", err)
 	}
 
-	filteredPRs, err := filterPRsByPath(ctx, github, prs, concurrency)
+	filteredPRs, err := filterPRsByPath(ctx, github, prs, concurrency, request.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -116,12 +116,26 @@ func runBounded(n int, concurrency int, fn func(i int)) {
 // (bounded by concurrency) and returns the matching PRs in the same order
 // GetPullRequests returned them, so downstream cursor-based version diffing
 // stays deterministic regardless of which goroutine finishes first.
-func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*models.PullRequest, concurrency int) ([]*models.PullRequest, error) {
+//
+// lastVersion is the resource's last known version (nil on the very first
+// check). For the one PR it refers to, its Commit is passed to
+// MatchesPathFilters as sinceSHA, scoping the path check to files changed
+// since that build rather than the PR's entire history — see
+// MatchesPathFilters. Every other PR has no previously-known commit here
+// (list mode only remembers this single cursor, not a per-PR history — the
+// same limitation documented on applyCommentTriggers), so it falls back to
+// the full-PR diff.
+func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*models.PullRequest, concurrency int, lastVersion *models.Version) ([]*models.PullRequest, error) {
 	matches := make([]bool, len(prs))
 	errs := make([]error, len(prs))
 
 	runBounded(len(prs), concurrency, func(i int) {
-		m, err := github.MatchesPathFilters(ctx, prs[i])
+		pr := prs[i]
+		var sinceSHA string
+		if lastVersion != nil && lastVersion.PR == strconv.Itoa(pr.Number) {
+			sinceSHA = lastVersion.Commit
+		}
+		m, err := github.MatchesPathFilters(ctx, pr, sinceSHA)
 		matches[i] = m
 		errs[i] = err
 	})

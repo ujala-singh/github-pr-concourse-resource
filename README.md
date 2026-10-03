@@ -217,8 +217,8 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | `v3_endpoint` | No | `https://api.github.com` | GitHub API v3 endpoint (for GitHub Enterprise) |
 | `v4_endpoint` | No | `https://api.github.com/graphql` | GitHub API v4 endpoint (for GitHub Enterprise) |
 | `hosting_endpoint` | No | `https://github.com` | GitHub hosting endpoint (for GitHub Enterprise) |
-| `paths` | No | `[]` | Only trigger on PRs that change files matching these patterns |
-| `ignore_paths` | No | `[]` | Ignore PRs that only change files matching these patterns |
+| `paths` | No | `[]` | Only trigger on PRs that change files matching these patterns. Checked against files changed since the last build for an already-tracked PR, or the PR's full base...HEAD diff when there's no previous build to diff from (e.g. a PR appearing for the first time) — see [Path Filtering and Diff Scope](#path-filtering-and-diff-scope). |
+| `ignore_paths` | No | `[]` | Ignore PRs that only change files matching these patterns. Same diff scope as `paths` above. |
 | `disable_ci_skip` | No | `false` | If `false`, PRs with `[ci skip]` or `[skip ci]` in title are skipped |
 | `skip_ssl_verification` | No | `false` | Skip SSL certificate verification (use with caution!) |
 | `disable_forks` | No | `false` | Only trigger on PRs from the same repository |
@@ -280,6 +280,13 @@ In both modes, the very first `trigger_comments`-eligible check for a PR (or the
 **Single PR Mode**: Returns list of commits to the specified PR. A new version is emitted for each new commit, or (if `trigger_comments` is set) for a matching comment.
 
 > Every version this resource returns carries two extra fields you'll see in Concourse's resource-version listing whenever `trigger_comments` is configured: `comment_id` and `comment_baseline`. These are an internal watermark, not a log of every comment ever posted — `comment_id` is just the highest matching-comment ID seen so far, and `comment_baseline` marks that the watermark has been established at least once. They show up on ordinary commit-triggered versions too (not just comment-triggered ones) because the resource needs that watermark carried forward on every version to correctly detect the *next* new comment. If you don't set `trigger_comments`, neither field appears.
+
+### Path Filtering and Diff Scope
+
+`paths`/`ignore_paths` are checked against the files changed **since the last build** for a PR this resource already has a previous commit recorded for — not against the PR's entire history. This matters because GitHub's "list files changed in a PR" API always returns the full base-branch-to-HEAD diff, no matter which commit you ask about: without scoping to a specific commit range, a PR that touched a matching path in *any* commit would keep matching forever, even once its latest push only changed unrelated files, causing redundant/surprising re-triggers.
+
+- **Single PR Mode**: fully correct. This mode always has a reliable previous commit (the one it last built) to diff from.
+- **PR List Mode**: correct for whichever PR currently *is* the resource's single tracked cursor (see [Comment Triggers](#comment-triggers) for the same cursor concept). For every other PR — one appearing for the first time, or one the cursor has moved away from — there's no previous commit to diff from, so the check falls back to the PR's full base...HEAD diff, same as before this existed. In practice this means: a PR you're actively pushing to gets precise, per-push path filtering once it's been checked at least once; a PR nobody's touched recently is evaluated on its full history, same as always.
 
 ### Concurrency
 
