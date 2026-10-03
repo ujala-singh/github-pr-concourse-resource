@@ -272,7 +272,7 @@ func TestGithubAppTokenSource(t *testing.T) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, `{"message": "Bad credentials"}`)
+			_, _ = fmt.Fprint(w, `{"message": "Bad credentials"}`)
 		})
 		server := httptest.NewServer(mux)
 		defer server.Close()
