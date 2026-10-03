@@ -159,7 +159,12 @@ func newTestGithubClient(t *testing.T, mux *http.ServeMux) *models.GithubClient 
 		t.Fatalf("failed to parse test server URL: %v", err)
 	}
 
-	v3 := github.NewClient(nil)
+	// A dedicated *http.Transport, not github.NewClient(nil) — see
+	// models/github_paths_test.go's newTestGithubClientForPaths for why
+	// nil (which falls back to the shared, process-wide
+	// http.DefaultTransport) can hang a test under heavy repeated runs by
+	// reusing a stale connection to an already-closed httptest.Server.
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	v3.BaseURL = baseURL
 
 	return &models.GithubClient{
@@ -250,7 +255,7 @@ func newTestPathFilterGithubClient(t *testing.T, paths []string, filesByPR map[i
 		t.Fatalf("failed to parse test server URL: %v", err)
 	}
 
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	v3.BaseURL = baseURL
 
 	return &models.GithubClient{
@@ -437,7 +442,7 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to parse test server URL: %v", err)
 	}
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	v3.BaseURL = baseURL
 	gc := &models.GithubClient{
 		V3: v3,
@@ -592,7 +597,7 @@ func TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck(t *testing.T) 
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
 		t.Fatalf("failed to parse test server URL: %v", err)
@@ -708,7 +713,7 @@ func TestCheck_RespectsConfiguredCheckConcurrency(t *testing.T) {
 		server := httptest.NewServer(mux)
 		t.Cleanup(server.Close)
 
-		v3 := github.NewClient(nil)
+		v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 		baseURL, err := url.Parse(server.URL + "/")
 		if err != nil {
 			t.Fatalf("failed to parse test server URL: %v", err)
@@ -793,7 +798,7 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
 		t.Fatalf("failed to parse test server URL: %v", err)
@@ -887,7 +892,7 @@ func TestCheck_CommentWatermarks_SurviveCursorMovingToADifferentPR(t *testing.T)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
 		t.Fatalf("failed to parse test server URL: %v", err)

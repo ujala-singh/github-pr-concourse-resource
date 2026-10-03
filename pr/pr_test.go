@@ -560,7 +560,7 @@ func TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck(t *testing.T) 
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
 		t.Fatalf("failed to parse test server URL: %v", err)
@@ -641,7 +641,7 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
-	v3 := github.NewClient(nil)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
 		t.Fatalf("failed to parse test server URL: %v", err)
