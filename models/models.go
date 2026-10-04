@@ -251,21 +251,22 @@ type Version struct {
 	// CommentBaseline is true once the comment-trigger watermark above has
 	// been established at least once. Until then, CommentID == 0 is
 	// ambiguous (never checked vs. checked-and-found-nothing).
+	//
+	// CommentID/CommentBaseline describe only the one PR this version is
+	// about. In prlist (list) mode, Concourse's check protocol only ever
+	// hands back the single version it considers "latest" — there's no
+	// per-PR history — so a PR's comment-trigger baseline only survives
+	// while it keeps being that "latest" version. If the cursor moves to a
+	// different PR for a while, a later comment on this one is treated as
+	// establishing a fresh baseline rather than firing (see
+	// applyCommentTriggers). An earlier design tried to carry every
+	// tracked PR's watermark forward in a shared per-check table embedded
+	// in every version, to survive exactly that; it caused the opposite,
+	// worse problem instead — one PR's watermark changing made every
+	// OTHER open PR's version look different too, spuriously rebuilding
+	// already-built commits. Losing a baseline occasionally (self-heals on
+	// the next comment) is the smaller cost.
 	CommentBaseline bool `json:"-"`
-	// CommentWatermarks is prlist mode's per-PR comment-trigger watermark
-	// table: PR number (as a string) -> highest matching comment ID seen
-	// for that PR. CommentID/CommentBaseline above only ever describe the
-	// one PR this specific version is about; this map is how watermarks
-	// for OTHER PRs survive the single-cursor limitation of Concourse's
-	// check protocol (it only ever hands back the one version it
-	// considers "latest" — there's no API to ask for "the version you
-	// last recorded for PR #20" specifically). By stamping the full,
-	// current map onto every version prlist.Check emits, whichever one
-	// Concourse remembers next carries every tracked PR's watermark
-	// forward, not just the PR that version happens to be about. Nil/empty
-	// when trigger_comments is unset, or in single-PR mode (which has no
-	// "other PRs" to track and uses CommentID/CommentBaseline directly).
-	CommentWatermarks map[string]int64 `json:"-"`
 }
 
 // MarshalJSON encodes the version as map[string]string, as required by the
@@ -288,19 +289,6 @@ func (v Version) MarshalJSON() ([]byte, error) {
 	}
 	if v.CommentBaseline {
 		m["comment_baseline"] = "true"
-	}
-	if len(v.CommentWatermarks) > 0 {
-		// encoding/json sorts map[string]T keys lexicographically, so this
-		// is deterministic for a given map's contents — essential here:
-		// if the same watermarks produced different byte strings across
-		// checks, every other version carrying this field would look
-		// "new" to Concourse's ATC every time, spuriously retriggering
-		// jobs for commits that didn't actually change.
-		watermarksJSON, err := json.Marshal(v.CommentWatermarks)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal comment_watermarks: %w", err)
-		}
-		m["comment_watermarks"] = string(watermarksJSON)
 	}
 	return json.Marshal(m)
 }
@@ -334,13 +322,9 @@ func (v *Version) UnmarshalJSON(data []byte) error {
 		v.CommentID = n
 	}
 
-	if s, ok := m["comment_watermarks"]; ok && s != "" {
-		var watermarks map[string]int64
-		if err := json.Unmarshal([]byte(s), &watermarks); err != nil {
-			return fmt.Errorf("invalid comment_watermarks %q: %w", s, err)
-		}
-		v.CommentWatermarks = watermarks
-	}
+	// A "comment_watermarks" key from a version recorded before this field
+	// was removed is simply ignored here (m is a plain map, decoded above
+	// — an unrecognized key is never an error), not an upgrade hazard.
 
 	return nil
 }

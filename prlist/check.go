@@ -3,7 +3,6 @@ package prlist
 import (
 	"context"
 	"fmt"
-	"maps"
 	"strconv"
 	"sync"
 
@@ -79,70 +78,14 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	}
 
 	if len(request.Source.TriggerComments) > 0 {
-		commentScopePRs := commentTriggerScope(filteredPRs, prs, request.Version)
 		var err error
-		versions, err = applyCommentTriggers(ctx, request, github, commentScopePRs, prs, versions, concurrency)
+		versions, err = applyCommentTriggers(ctx, request, github, prs, versions, concurrency)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	return versions, nil
-}
-
-// commentTriggerScope returns every PR that should be scanned for a
-// trigger-comment match this check: every path-matching PR (filteredPRs,
-// which is scoped to "did the latest push touch a matching path" — the
-// right question for commit-triggering, but the wrong one for
-// comment-triggering, since a comment isn't a push), plus every PR this
-// resource has an established comment-trigger watermark for (see
-// commentWatermarks) that's still open. Without the second part, a PR
-// would permanently lose comment-trigger eligibility the moment an
-// unrelated push stopped it from path-matching, or the moment Concourse's
-// single version cursor moved on to a different PR entirely — both are
-// real incidents this was built to fix, not hypothetical.
-func commentTriggerScope(filteredPRs, allPRs []*models.PullRequest, lastVersion *models.Version) []*models.PullRequest {
-	tracked := commentWatermarks(lastVersion)
-	if len(tracked) == 0 {
-		return filteredPRs
-	}
-
-	scope := append([]*models.PullRequest(nil), filteredPRs...)
-	seen := make(map[int]bool, len(scope))
-	for _, pr := range scope {
-		seen[pr.Number] = true
-	}
-
-	for _, pr := range allPRs {
-		if seen[pr.Number] {
-			continue
-		}
-		if _, ok := tracked[strconv.Itoa(pr.Number)]; ok {
-			scope = append(scope, pr)
-			seen[pr.Number] = true
-		}
-	}
-	return scope
-}
-
-// commentWatermarks returns lastVersion's per-PR comment-trigger watermark
-// table (PR number -> highest matching comment ID seen for it so far),
-// falling back to the legacy single-PR CommentID/CommentBaseline fields
-// when CommentWatermarks is empty — e.g. right after upgrading from a
-// version of this resource that predates per-PR tracking, so the one PR
-// that was the reliable cursor carries its watermark forward into the new
-// table instead of silently resetting and re-establishing a baseline.
-func commentWatermarks(lastVersion *models.Version) map[string]int64 {
-	if lastVersion == nil {
-		return nil
-	}
-	if len(lastVersion.CommentWatermarks) > 0 {
-		return lastVersion.CommentWatermarks
-	}
-	if lastVersion.CommentBaseline {
-		return map[string]int64{lastVersion.PR: lastVersion.CommentID}
-	}
-	return nil
 }
 
 // runBounded runs fn(i) for i in [0, n) with at most concurrency goroutines
@@ -209,51 +152,56 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 	return filtered, nil
 }
 
-// applyCommentTriggers scans every PR in scopePRs for a comment matching
-// source.trigger_comments and appends an extra version for any PR whose
-// latest matching comment is new since this resource last observed that
-// specific PR.
+// applyCommentTriggers scans every currently open PR for a comment
+// matching source.trigger_comments, stamping the latest match onto that
+// PR's own already-present version (if any) and appending an extra
+// version for any PR that genuinely triggered but isn't otherwise part of
+// this check's output (its latest push doesn't match source.paths).
 //
-// Per-PR watermarks (models.Version.CommentWatermarks) replace what used
-// to be a single cursor-wide watermark: Concourse's check protocol only
-// ever hands back the one version it considers "latest," not a per-PR
-// history, so earlier versions of this function could only reliably track
-// whichever single PR that version happened to be about. By folding every
-// tracked PR's watermark into one map and carrying the complete, current
-// table forward on whichever version Concourse ends up remembering as
-// "latest" next, the table survives regardless of which PR that happens
-// to be about — removing that limitation.
-//
-// allPRs (every currently open, GitHub-API-matching PR, not just
-// path-filtered ones) is used to prune entries for PRs that have
-// closed/merged/dropped out, bounding the map to roughly the current
-// open-PR count rather than growing forever — but that pruning is only
-// ever applied on a cycle where something else already makes a version
-// new (a genuine trigger, or a PR entering tracked scope for the first
-// time), never on its own. See the comment above the usePruned
-// computation below for why: eagerly changing the table's content purely
-// because some OTHER PR closed, while every version carried the full
-// table, used to make Concourse rebuild every open PR's already-built
-// commit the moment any one of them closed.
-func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, scopePRs []*models.PullRequest, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
-	tracked := commentWatermarks(request.Version)
+// Each PR's CommentID/CommentBaseline describes only that one PR — there
+// is no shared, multi-PR watermark table. Concourse's check protocol only
+// ever hands back the single version it considers "latest," so a PR's
+// comment-trigger baseline only survives while it keeps being that
+// "latest" version; if the cursor moves to a different PR for a while, a
+// later comment on this one is treated as establishing a fresh baseline
+// rather than firing (see models.Version.CommentBaseline). An earlier
+// design tried to carry every tracked PR's watermark forward in one table
+// embedded in every version, specifically to survive that gap. It caused
+// a worse problem instead, confirmed live against a running pipeline: one
+// PR's watermark changing — including just that PR closing — made every
+// OTHER open PR's version look different too, spuriously rebuilding
+// already-built commits. Occasionally losing a baseline is a smaller,
+// self-healing cost (the very next matching comment establishes a new
+// one) than that.
+func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
+	cursorPR := ""
+	if request.Version != nil {
+		cursorPR = request.Version.PR
+	}
 
 	type result struct {
+		pr            *models.PullRequest
 		latestMatchID int64
 		triggered     bool
 		err           error
 	}
-	results := make([]result, len(scopePRs))
+	results := make([]result, len(allPRs))
 
-	// The GitHub calls (one ListComments per PR) run concurrently; the
-	// version-mutation pass below stays sequential over scopePRs in its
-	// original order, so the output is deterministic regardless of which
-	// goroutine finishes first.
-	runBounded(len(scopePRs), concurrency, func(i int) {
-		pr := scopePRs[i]
+	// Every currently open PR is scanned, regardless of path match, so a
+	// comment trigger works even when the latest push doesn't touch a
+	// matching path. The GitHub calls run concurrently; the
+	// version-mutation pass below stays sequential over allPRs' original
+	// order, so the output is deterministic regardless of which goroutine
+	// finishes first.
+	runBounded(len(allPRs), concurrency, func(i int) {
+		pr := allPRs[i]
 		prKey := strconv.Itoa(pr.Number)
+		baselineEstablished := cursorPR == prKey && request.Version.CommentBaseline
 
-		sinceID, baselineEstablished := tracked[prKey]
+		var sinceID int64
+		if baselineEstablished {
+			sinceID = request.Version.CommentID
+		}
 
 		latestMatchID, triggered, err := github.CheckTriggerComments(ctx, pr.Number, request.Source.TriggerComments, sinceID)
 		if err != nil {
@@ -263,7 +211,7 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		if !baselineEstablished {
 			triggered = false
 		}
-		results[i] = result{latestMatchID: latestMatchID, triggered: triggered}
+		results[i] = result{pr: pr, latestMatchID: latestMatchID, triggered: triggered}
 	})
 
 	for _, r := range results {
@@ -272,101 +220,50 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		}
 	}
 
-	// Grow-only overlay of the tracked table with this cycle's scan
-	// results. This alone never removes anything, so a value here only
-	// differs from tracked[prKey] in two cases: a real trigger fired for
-	// an already-tracked PR (handled below — that PR's own triggered
-	// entry is a genuinely new version regardless), or prKey is entering
-	// tracked scope for the first time. The second case always coincides
-	// with that PR's OWN (pr, commit) version also being new — it's never
-	// been returned before — so there's always an independently-new place
-	// to carry it, never a need to perturb an unrelated, unchanged PR.
-	overlaid := make(map[string]int64, len(tracked)+len(scopePRs))
-	maps.Copy(overlaid, tracked)
-	for i, pr := range scopePRs {
-		overlaid[strconv.Itoa(pr.Number)] = results[i].latestMatchID
-	}
-
-	newKeys := make(map[string]bool)
-	for prKey := range overlaid {
-		if _, existed := tracked[prKey]; !existed {
-			newKeys[prKey] = true
-		}
-	}
-
-	anyTriggered := false
+	byPR := make(map[string]result, len(results))
 	for _, r := range results {
-		if r.triggered {
-			anyTriggered = true
-			break
-		}
+		byPR[strconv.Itoa(r.pr.Number)] = r
 	}
 
-	// Dropping PRs that closed/merged out of the table is deferred until a
-	// cycle where something else ALREADY makes a version new (a genuine
-	// trigger, or a newKeys PR's own first-ever version) — never performed
-	// on its own. Pruning eagerly, every check regardless, was the bug:
-	// since it changes the table's content purely because some OTHER PR
-	// closed, and the table used to get stamped onto every returned
-	// version, Concourse's ATC (which compares the whole version map for
-	// equality) saw every other open, completely unchanged PR as a new
-	// version and rebuilt their already-built commits. Deferring costs
-	// nothing but a few stale entries lingering in the table a bit longer
-	// — bounded by how long it takes before any real activity happens
-	// again, at which point that activity's own new version absorbs the
-	// prune for free.
-	usePruned := anyTriggered || len(newKeys) > 0
-	newWatermarks := overlaid
-	if usePruned {
-		openPRs := make(map[string]bool, len(allPRs))
-		for _, pr := range allPRs {
-			openPRs[strconv.Itoa(pr.Number)] = true
-		}
-		pruned := make(map[string]int64, len(overlaid))
-		for prKey, id := range overlaid {
-			if openPRs[prKey] {
-				pruned[prKey] = id
-			}
-		}
-		newWatermarks = pruned
-	}
-
-	// When nothing triggered this cycle, a triggered entry (appended
-	// below, always last) isn't available to carry the table forward —
-	// fall back to one of the newKeys PRs' own base versions instead,
-	// moving it last so it's the one Concourse remembers as "latest" next.
-	// usePruned guarantees at least one exists whenever this runs: it's
-	// only true here because len(newKeys) > 0 (anyTriggered is false in
-	// this branch).
-	if usePruned && !anyTriggered {
-		for j := range versions {
-			if !newKeys[versions[j].PR] {
-				continue
-			}
-			versions[j].CommentBaseline = true
-			versions[j].CommentWatermarks = newWatermarks
-			if id, ok := newWatermarks[versions[j].PR]; ok {
-				versions[j].CommentID = id
-			}
-			last := len(versions) - 1
-			versions[j], versions[last] = versions[last], versions[j]
-			break
-		}
-	}
-
-	for i, pr := range scopePRs {
-		if !results[i].triggered {
+	// Stamp each PR's own, freshly observed comment state onto its own
+	// already-present version. This never looks at any other PR's data,
+	// so a stable PR's entry stays byte-identical check to check as long
+	// as its own comments haven't changed — nothing happening on a
+	// different PR can ever perturb it.
+	present := make(map[string]bool, len(versions))
+	for j := range versions {
+		present[versions[j].PR] = true
+		r, ok := byPR[versions[j].PR]
+		if !ok {
 			continue
 		}
-		prKey := strconv.Itoa(pr.Number)
+		versions[j].CommentID = r.latestMatchID
+		versions[j].CommentBaseline = true
+		if r.triggered {
+			// The entry being updated might be the "echo back the last
+			// known version" fallback rather than a fresh snapshot (e.g.
+			// this PR's latest push doesn't currently match
+			// source.paths), which can carry a stale commit. Refresh it
+			// to the PR's actual current HEAD so a genuine trigger always
+			// reflects what's really there to build, not a leftover
+			// value from whenever this PR last path-matched.
+			versions[j].Commit = r.pr.HeadRefOID
+			versions[j].CommittedDate = r.pr.CommittedDate
+			versions[j].ApprovedReviewCount = r.pr.ApprovedReviewCount
+		}
+	}
+
+	for _, r := range results {
+		if !r.triggered || present[strconv.Itoa(r.pr.Number)] {
+			continue
+		}
 		versions = append(versions, models.Version{
-			PR:                  prKey,
-			Commit:              pr.HeadRefOID,
-			CommittedDate:       pr.CommittedDate,
-			ApprovedReviewCount: pr.ApprovedReviewCount,
-			CommentID:           newWatermarks[prKey],
+			PR:                  strconv.Itoa(r.pr.Number),
+			Commit:              r.pr.HeadRefOID,
+			CommittedDate:       r.pr.CommittedDate,
+			ApprovedReviewCount: r.pr.ApprovedReviewCount,
+			CommentID:           r.latestMatchID,
 			CommentBaseline:     true,
-			CommentWatermarks:   newWatermarks,
 		})
 	}
 

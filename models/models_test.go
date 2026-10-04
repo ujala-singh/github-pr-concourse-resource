@@ -215,10 +215,6 @@ func TestVersion_MarshalJSON_IsProtocolCompliant(t *testing.T) {
 			name:    "with every field populated",
 			version: Version{PR: "42", Commit: "abc123", CommittedDate: "2026-01-01T00:00:00Z", ApprovedReviewCount: 3, CommentID: 555, CommentBaseline: true},
 		},
-		{
-			name:    "with comment watermarks for multiple PRs",
-			version: Version{PR: "42", Commit: "abc123", CommentBaseline: true, CommentWatermarks: map[string]int64{"5": 5971991589, "20": 42}},
-		},
 	}
 
 	for _, tt := range tests {
@@ -274,10 +270,6 @@ func TestVersion_JSONRoundTrip(t *testing.T) {
 		{
 			name: "every field populated",
 			in:   Version{PR: "1", Commit: "sha123", CommittedDate: "2026-01-01T00:00:00Z", ApprovedReviewCount: 5, CommentID: 42, CommentBaseline: true},
-		},
-		{
-			name: "comment watermarks for multiple PRs",
-			in:   Version{PR: "1", Commit: "sha123", CommentBaseline: true, CommentWatermarks: map[string]int64{"1": 42, "5": 5971991589, "20": 0}},
 		},
 	}
 
@@ -385,36 +377,5 @@ func TestVersion_UnmarshalJSON_RejectsNonStringWireValues(t *testing.T) {
 				t.Fatalf("expected an error decoding non-string wire value %s, got none (v = %+v)", tt.data, v)
 			}
 		})
-	}
-}
-
-// TestVersion_MarshalJSON_CommentWatermarksIsDeterministic guards the
-// property applyCommentTriggers' map-stamping relies on: marshaling the
-// exact same CommentWatermarks content must always produce the exact same
-// bytes, regardless of Go map iteration order. If it didn't, every version
-// carrying this field would look "new" to Concourse's ATC on every check
-// even when nothing about the watermarks actually changed, spuriously
-// retriggering jobs for commits that didn't change.
-func TestVersion_MarshalJSON_CommentWatermarksIsDeterministic(t *testing.T) {
-	v := Version{
-		PR: "1",
-		CommentWatermarks: map[string]int64{
-			"100": 1, "5": 2, "42": 3, "7": 4, "999": 5, "1": 6, "20": 7,
-		},
-	}
-
-	first, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("Marshal error: %v", err)
-	}
-
-	for i := range 20 {
-		got, err := json.Marshal(v)
-		if err != nil {
-			t.Fatalf("Marshal error on attempt %d: %v", i, err)
-		}
-		if string(got) != string(first) {
-			t.Fatalf("non-deterministic output on attempt %d:\nfirst: %s\ngot:   %s", i, first, got)
-		}
 	}
 }
