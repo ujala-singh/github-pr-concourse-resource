@@ -498,15 +498,14 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 	}
 }
 
-// TestApplyCommentTriggers_MergedPROnlyPerturbsOneOpenPR is a regression
+// TestApplyCommentTriggers_MergedPRAlonePerturbsNothing is a regression
 // test for the exact reported bug: merging PR #3 (dropping it out of the
-// open-PR list) must not spuriously rebuild every OTHER open, unrelated PR
-// at its already-built commit. PR #3's watermark entry is pruned out of
-// the shared table this check, which changes the table's content — but
-// with no PR actually triggering this cycle, the only version allowed to
-// carry that change forward is the single one that ends up last, and every
-// OTHER tracked-but-untouched PR must come back exactly as it went in.
-func TestApplyCommentTriggers_MergedPROnlyPerturbsOneOpenPR(t *testing.T) {
+// open-PR list) must not rebuild ANY other open, unrelated PR at its
+// already-built commit — not even one of them. With no PR triggering and
+// no new PR entering scope this cycle, there is no independently-new
+// version to carry the pruned table on, so pruning PR #3 out of it is
+// deferred rather than forced onto an otherwise-untouched PR.
+func TestApplyCommentTriggers_MergedPRAlonePerturbsNothing(t *testing.T) {
 	mux := http.NewServeMux()
 	for _, number := range []int{1, 2} {
 		// Same comment id as the existing watermark — nothing new, no trigger.
@@ -547,22 +546,75 @@ func TestApplyCommentTriggers_MergedPROnlyPerturbsOneOpenPR(t *testing.T) {
 		t.Fatalf("expected no extra triggered versions, got %d: %+v", len(versions), versions)
 	}
 
-	// PR #1 is NOT the carrier (it's not last) and must come back untouched —
-	// this is the crux of the bug: before the fix, PR #3 merging would have
-	// stamped a changed comment_watermarks blob onto PR #1 too, making
-	// Concourse rebuild its already-built "sha-1" commit for no reason.
-	if versions[0].CommentBaseline || versions[0].CommentWatermarks != nil {
-		t.Errorf("PR #1 version was perturbed by PR #3's merge: %+v", versions[0])
+	// Neither PR #1 nor PR #2 should be perturbed — this is the crux of the
+	// bug: before this fix, PR #3 merging would have stamped a changed
+	// comment_watermarks blob onto at least one of them (first onto every
+	// open PR, then, after the first mitigation, onto whichever ended up
+	// last), making Concourse rebuild an already-built commit for no reason.
+	for i, v := range versions {
+		if v.CommentBaseline || v.CommentWatermarks != nil {
+			t.Errorf("versions[%d] (PR #%s) was perturbed by PR #3's merge alone: %+v", i, v.PR, v)
+		}
+	}
+}
+
+// TestApplyCommentTriggers_DeferredPruneFiresOnNextRealTrigger shows the
+// other half of the contract above: PR #3's closure isn't lost forever —
+// once something legitimately new happens (here, PR #1 gets a real new
+// comment), that PR's own triggered version absorbs the deferred prune for
+// free.
+func TestApplyCommentTriggers_DeferredPruneFiresOnNextRealTrigger(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 100, "body": "concourse plan"}, {"id": 150, "body": "concourse plan"}]`)
+	})
+	mux.HandleFunc("/repos/owner/repo/issues/2/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 200, "body": "concourse plan"}]`)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr1 := &models.PullRequest{Number: 1, HeadRefOID: "sha-1", CommittedDate: "2026-01-01T00:00:00Z"}
+	pr2 := &models.PullRequest{Number: 2, HeadRefOID: "sha-2", CommittedDate: "2026-01-01T00:00:00Z"}
+	baseVersions := []models.Version{
+		{PR: "1", Commit: "sha-1"},
+		{PR: "2", Commit: "sha-2"},
 	}
 
-	// PR #2 (last in the slice) is the one allowed to carry the updated
-	// table forward, with PR #3 correctly pruned out of it.
-	if !versions[1].CommentBaseline {
-		t.Error("PR #2 (the carrier) should have CommentBaseline = true")
+	// PR #3's stale watermark is still sitting in the table from before it
+	// merged, carried forward untouched by the previous (no-op) check.
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR:                "2",
+			Commit:            "sha-2",
+			CommentWatermarks: map[string]int64{"1": 100, "2": 200, "3": 300},
+		},
 	}
-	want := map[string]int64{"1": 100, "2": 200}
-	if !maps.Equal(versions[1].CommentWatermarks, want) {
-		t.Errorf("PR #2 CommentWatermarks = %v, want %v (PR #3 pruned)", versions[1].CommentWatermarks, want)
+
+	versions, err := applyCommentTriggers(
+		context.Background(), request, gc,
+		[]*models.PullRequest{pr1, pr2}, []*models.PullRequest{pr1, pr2},
+		baseVersions, DefaultCheckConcurrency,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Base versions for PR #1 and #2 must still come back untouched; only
+	// the triggered extra version carries the table.
+	for i, v := range versions[:2] {
+		if v.CommentBaseline || v.CommentWatermarks != nil {
+			t.Errorf("base versions[%d] (PR #%s) was perturbed: %+v", i, v.PR, v)
+		}
+	}
+
+	triggeredVersions := versions[2:]
+	if len(triggeredVersions) != 1 || triggeredVersions[0].PR != "1" {
+		t.Fatalf("expected exactly one triggered version for PR #1, got %+v", triggeredVersions)
+	}
+	want := map[string]int64{"1": 150, "2": 200}
+	if !maps.Equal(triggeredVersions[0].CommentWatermarks, want) {
+		t.Errorf("triggered version CommentWatermarks = %v, want %v (PR #3 finally pruned)", triggeredVersions[0].CommentWatermarks, want)
 	}
 }
 
