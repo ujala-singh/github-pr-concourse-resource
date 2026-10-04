@@ -3,6 +3,7 @@ package prlist
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"sync"
 
@@ -168,30 +169,44 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // matching source.trigger_comments, stamping the latest match onto that
 // PR's own already-present version (if any) and appending an extra
 // version for any PR that genuinely triggered but isn't otherwise part of
-// this check's output (its latest push doesn't match source.paths). It
-// also always appends a dedicated bookkeeping version (PR == sentinelPR)
-// carrying every tracked PR's watermark forward, so a later check can
-// recover any PR's own prior watermark regardless of which real PR's
-// version Concourse happens to remember as "latest" in between.
+// this check's output (its latest push doesn't match source.paths).
 //
 // A real PR's own CommentID/CommentBaseline still describes only that one
 // PR — nothing about PR B's version ever depends on PR A's data — so
 // those fields are never perturbed by another PR's activity, including
-// that PR closing. Two earlier designs got this wrong in different ways:
-// one embedded a shared, multi-PR table directly on every real PR's
-// version (any PR's watermark changing made every other one look new and
-// rebuilt its already-built commit); the other dropped the shared table
+// that PR closing. Earlier designs got this wrong in different ways: one
+// embedded a shared, multi-PR table directly on every real PR's version
+// (any PR's watermark changing made every other one look new and
+// rebuilt its already-built commit); another dropped the shared table
 // entirely in favor of a single implicit cursor (request.Version.PR),
 // which meant commenting on two different PRs within the same check
-// window silently dropped whichever one wasn't already the cursor.
-// Confining the shared table to one dedicated, non-PR version avoids
-// both: only the bookkeeping version's own (cheap, no-op) build is
-// affected when the table changes, and every PR's watermark is always
-// reliably recoverable from it. The pipeline's own task script needs to
-// recognize sentinelPR and skip real work for it — see prlist.In.
+// window silently dropped whichever one wasn't already the cursor; a
+// third always appended a dedicated bookkeeping version (PR ==
+// sentinelPR) LAST on every single check, which broke plain
+// commit-triggering: confirmed live, Concourse treats a check's last
+// returned element as "current," and re-ranks even an unchanged entry
+// ahead of others whenever it reappears, so an always-last bookkeeping
+// version permanently buried any real commit that landed in the same or
+// a later check cycle — the commit was correctly recorded in history but
+// never actually built.
+//
+// This version only touches the shared table on a check where it
+// genuinely changed (a real trigger fired somewhere, a PR entered
+// tracked scope for the first time, or a PR closed/merged), and even
+// then prefers to piggyback the table onto whichever entry is ALREADY
+// legitimately new that cycle (a triggered PR, or a brand-new PR's own
+// first-ever version) rather than adding a separate entry — falling back
+// to a standalone bookkeeping version only when nothing else is changing
+// (e.g. a PR merged and that's the only thing that happened). A plain
+// new commit, with no comment activity involved, is never touched by any
+// of this: it flows through untouched and is free to be the check's last
+// element, so Concourse builds it normally. request.Version.CommentWatermarks
+// is read regardless of which PR that version happens to be about — it's
+// never restricted to only the bookkeeping version — since a piggybacked
+// real PR version carries it just as well.
 func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
 	var tracked map[string]int64
-	if request.Version != nil && request.Version.PR == sentinelPR {
+	if request.Version != nil {
 		tracked = request.Version.CommentWatermarks
 	}
 
@@ -267,12 +282,34 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		}
 	}
 
+	anyTriggered := false
 	for _, r := range results {
-		if !r.triggered || present[strconv.Itoa(r.pr.Number)] {
+		if r.triggered {
+			anyTriggered = true
+			break
+		}
+	}
+
+	newKeys := make(map[string]bool)
+	for prKey := range newTable {
+		if _, existed := tracked[prKey]; !existed {
+			newKeys[prKey] = true
+		}
+	}
+
+	triggeredPRs := make(map[string]bool)
+	for _, r := range results {
+		if !r.triggered {
+			continue
+		}
+		prKey := strconv.Itoa(r.pr.Number)
+		triggeredPRs[prKey] = true
+		if present[prKey] {
+			// Already stamped in place above — don't duplicate the entry.
 			continue
 		}
 		versions = append(versions, models.Version{
-			PR:                  strconv.Itoa(r.pr.Number),
+			PR:                  prKey,
 			Commit:              r.pr.HeadRefOID,
 			CommittedDate:       r.pr.CommittedDate,
 			ApprovedReviewCount: r.pr.ApprovedReviewCount,
@@ -281,16 +318,68 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		})
 	}
 
-	// Always appended last, so it's the version Concourse remembers as
-	// "latest" for the next check — guaranteeing newTable (this cycle's
-	// complete, freshly pruned-to-currently-open-PRs table) is always
-	// recoverable next time, regardless of which real PR's version ends
-	// up being the one humans look at in the UI.
-	versions = append(versions, models.Version{
-		PR:                sentinelPR,
-		CommentBaseline:   true,
-		CommentWatermarks: newTable,
-	})
+	// newTable (this cycle's complete, freshly pruned-to-currently-open-PRs
+	// table) only needs to be recorded somewhere when it actually changed.
+	// Recomputing and re-returning an unchanged table costs nothing in
+	// theory, but re-touches whatever carries it every single check — see
+	// the doc comment above for why that broke real commit-triggering.
+	if !maps.Equal(tracked, newTable) {
+		attached := false
+		if anyTriggered {
+			// A triggered PR's entry is already genuinely new this cycle
+			// — piggyback the table there. It isn't necessarily the LAST
+			// entry already (e.g. a triggered PR that was already present
+			// among the base versions is stamped in place, not appended),
+			// so find it and move it last explicitly rather than assuming
+			// position — attaching the table to whatever happens to be
+			// last would risk landing on an unrelated, unchanged PR.
+			for j := range versions {
+				if !triggeredPRs[versions[j].PR] {
+					continue
+				}
+				versions[j].CommentWatermarks = newTable
+				last := len(versions) - 1
+				versions[j], versions[last] = versions[last], versions[j]
+				attached = true
+				break
+			}
+		} else if len(newKeys) > 0 {
+			// No trigger fired, but at least one PR entered tracked scope
+			// for the first time — that PR's own base version is
+			// therefore ALSO genuinely new this cycle (it's never been
+			// returned before), giving a safe, already-independently-new
+			// place to carry the table. Move it last so it's the version
+			// Concourse remembers as "latest" next.
+			//
+			// This isn't guaranteed to find a match: a newly-tracked PR
+			// that doesn't currently path-match has no base entry, and
+			// can't be a trigger either (a first observation never
+			// triggers, see baselineEstablished above) — it falls through
+			// to the sentinel fallback below in that case.
+			for j := range versions {
+				if !newKeys[versions[j].PR] {
+					continue
+				}
+				versions[j].CommentWatermarks = newTable
+				last := len(versions) - 1
+				versions[j], versions[last] = versions[last], versions[j]
+				attached = true
+				break
+			}
+		}
+		if !attached {
+			// Nothing else is changing this cycle (e.g. only a PR closed)
+			// — no safe entry exists to piggyback on without perturbing
+			// an unrelated, unchanged PR's version. Stand up a dedicated
+			// bookkeeping version instead; it's the only new thing this
+			// cycle, so it's safe for it to be last.
+			versions = append(versions, models.Version{
+				PR:                sentinelPR,
+				CommentBaseline:   true,
+				CommentWatermarks: newTable,
+			})
+		}
+	}
 
 	return versions, nil
 }
