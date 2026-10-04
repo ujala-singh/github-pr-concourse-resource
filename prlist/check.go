@@ -191,15 +191,27 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // never actually built.
 //
 // This version only touches the shared table on a check where it
-// genuinely changed (a real trigger fired somewhere, a PR entered
-// tracked scope for the first time, or a PR closed/merged), and even
-// then prefers to piggyback the table onto whichever entry is ALREADY
-// legitimately new that cycle (a triggered PR, or a brand-new PR's own
-// first-ever version) rather than adding a separate entry — falling back
-// to a standalone bookkeeping version only when nothing else is changing
-// (e.g. a PR merged and that's the only thing that happened). A plain
-// new commit, with no comment activity involved, is never touched by any
-// of this: it flows through untouched and is free to be the check's last
+// genuinely changed, and even then only piggybacks it onto a PR's entry
+// when that PR is ALREADY, unambiguously new this cycle for its own
+// reason: it has a genuine trigger. Everything else — a PR closing, a
+// brand-new PR appearing without yet triggering, or simply the previous
+// "latest" version happening to be a plain commit that carries no table
+// at all (in which case tracked looks empty even though nothing is
+// actually new) — falls back to a standalone bookkeeping version, never
+// to piggybacking on an arbitrary existing entry. An intermediate design
+// tried to also piggyback whenever a key was absent from tracked,
+// treating that as "a brand-new PR, safe to attach to" — but an absent
+// key is also exactly what a plain-commit "latest" version produces for
+// every PR, so that version — confirmed live — attached the table to a
+// stable, already-built PR's version essentially at random, spuriously
+// rebuilding it. There's no way to tell "genuinely new" apart from
+// "merely unrecoverable right now" from inside this function, so only
+// the unambiguous signal (a real trigger) is trusted to piggyback; this
+// costs one extra, harmless bookkeeping build the first time the table
+// needs re-establishing after a plain commit, which is a small, bounded
+// price for never again risking an unrelated PR's version. A plain new
+// commit, with no comment activity involved, is never touched by any of
+// this: it flows through untouched and is free to be the check's last
 // element, so Concourse builds it normally. request.Version.CommentWatermarks
 // is read regardless of which PR that version happens to be about — it's
 // never restricted to only the bookkeeping version — since a piggybacked
@@ -290,13 +302,6 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		}
 	}
 
-	newKeys := make(map[string]bool)
-	for prKey := range newTable {
-		if _, existed := tracked[prKey]; !existed {
-			newKeys[prKey] = true
-		}
-	}
-
 	triggeredPRs := make(map[string]bool)
 	for _, r := range results {
 		if !r.triggered {
@@ -343,36 +348,25 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 				attached = true
 				break
 			}
-		} else if len(newKeys) > 0 {
-			// No trigger fired, but at least one PR entered tracked scope
-			// for the first time — that PR's own base version is
-			// therefore ALSO genuinely new this cycle (it's never been
-			// returned before), giving a safe, already-independently-new
-			// place to carry the table. Move it last so it's the version
-			// Concourse remembers as "latest" next.
-			//
-			// This isn't guaranteed to find a match: a newly-tracked PR
-			// that doesn't currently path-match has no base entry, and
-			// can't be a trigger either (a first observation never
-			// triggers, see baselineEstablished above) — it falls through
-			// to the sentinel fallback below in that case.
-			for j := range versions {
-				if !newKeys[versions[j].PR] {
-					continue
-				}
-				versions[j].CommentWatermarks = newTable
-				last := len(versions) - 1
-				versions[j], versions[last] = versions[last], versions[j]
-				attached = true
-				break
-			}
 		}
 		if !attached {
-			// Nothing else is changing this cycle (e.g. only a PR closed)
-			// — no safe entry exists to piggyback on without perturbing
-			// an unrelated, unchanged PR's version. Stand up a dedicated
-			// bookkeeping version instead; it's the only new thing this
-			// cycle, so it's safe for it to be last.
+			// Nothing else is independently new this cycle to safely
+			// piggyback on. This covers several cases that all share the
+			// same shape — a PR closed/merged, a brand-new PR entered
+			// scope without yet triggering, or simply the previous
+			// version happened to be a plain commit that didn't carry the
+			// table (so tracked looks "empty" even though nothing is
+			// actually new) — and in every one of them, there's no way to
+			// tell "genuinely new" apart from "merely unrecoverable right
+			// now" from inside this function. Treating every key absent
+			// from tracked as "new" and piggybacking on it was tried and
+			// is unsafe: confirmed live, it attached the table to a
+			// completely stable, unrelated PR's version whenever the
+			// table simply hadn't been recoverable, spuriously rebuilding
+			// its already-built commit. A standalone bookkeeping version
+			// is the only way to persist the table without ever risking
+			// that — it's the sole new thing this cycle, so it's safe for
+			// it to be last.
 			versions = append(versions, models.Version{
 				PR:                sentinelPR,
 				CommentBaseline:   true,
