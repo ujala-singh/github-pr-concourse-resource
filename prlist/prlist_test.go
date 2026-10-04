@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -143,6 +146,54 @@ func TestInRequest_Validate(t *testing.T) {
 				t.Errorf("InRequest validation error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestIn_BookkeepingVersion_WritesMarkerWithoutGithubCalls verifies In
+// recognizes the comment-trigger bookkeeping version (PR == sentinelPR)
+// and short-circuits to a safe no-op instead of trying to look up or clone
+// a PR that doesn't exist — the regression this guards against is In
+// calling github.GetPullRequest(ctx, 0), which would fail outright.
+func TestIn_BookkeepingVersion_WritesMarkerWithoutGithubCalls(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("no GitHub API call should be made for the bookkeeping version, got request for %s", r.URL.Path)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	dest := t.TempDir()
+	version := models.Version{
+		PR:                sentinelPR,
+		CommentBaseline:   true,
+		CommentWatermarks: map[string]int64{"5": 42},
+	}
+	request := InRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: version,
+	}
+
+	response, err := In(request, gc, dest)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	markerPath := filepath.Join(dest, BookkeepingMarkerFile)
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Errorf("expected marker file %s to exist: %v", markerPath, err)
+	}
+
+	if response.Version.PR != sentinelPR {
+		t.Errorf("response version PR = %s, want %s", response.Version.PR, sentinelPR)
+	}
+
+	var prMeta *models.Metadata
+	for i := range response.Metadata {
+		if response.Metadata[i].Name == "pr" {
+			prMeta = &response.Metadata[i]
+		}
+	}
+	if prMeta == nil || prMeta.Value != sentinelPR {
+		t.Errorf("expected metadata pr=%s, got %+v", sentinelPR, response.Metadata)
 	}
 }
 
@@ -342,8 +393,79 @@ func TestApplyCommentTriggers_FirstObservation_EstablishesBaselineWithoutFiring(
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(versions) != 0 {
-		t.Fatalf("expected no triggered version on first observation of a PR, got %d: %+v", len(versions), versions)
+	for _, v := range versions {
+		if v.PR == "42" {
+			t.Fatalf("expected no triggered version on first observation of a PR, got one: %+v", versions)
+		}
+	}
+	// The bookkeeping version is still appended, establishing PR #42's
+	// baseline for a future check to compare against.
+	if len(versions) != 1 || versions[0].PR != sentinelPR {
+		t.Fatalf("expected exactly the bookkeeping version, got %+v", versions)
+	}
+	if versions[0].CommentWatermarks["42"] != 555 {
+		t.Errorf("bookkeeping CommentWatermarks[\"42\"] = %d, want 555 (establishing baseline)", versions[0].CommentWatermarks["42"])
+	}
+}
+
+// TestApplyCommentTriggers_SimultaneousCommentsOnTwoPRs_BothFire is the
+// definitive end-to-end regression test for the reported symptom that
+// motivated the bookkeeping version: commenting "concourse plan" on two
+// different PRs within the same check interval used to silently drop
+// whichever PR wasn't the single implicit cursor (request.Version.PR).
+// With watermarks read from the dedicated bookkeeping version instead,
+// both PRs' own prior baselines are reliably recoverable in the same
+// check, regardless of which real PR's version was last "latest" — so
+// both comments fire.
+func TestApplyCommentTriggers_SimultaneousCommentsOnTwoPRs_BothFire(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/39/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 100, "body": "concourse plan"}, {"id": 201, "body": "concourse plan"}]`)
+	})
+	mux.HandleFunc("/repos/owner/repo/issues/41/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 200, "body": "concourse plan"}, {"id": 202, "body": "concourse plan"}]`)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr39 := &models.PullRequest{Number: 39, HeadRefOID: "sha-39", CommittedDate: "2026-10-03T14:48:11Z"}
+	pr41 := &models.PullRequest{Number: 41, HeadRefOID: "sha-41", CommittedDate: "2026-10-04T07:52:31Z"}
+	baseVersions := []models.Version{
+		{PR: "39", Commit: "sha-39", CommittedDate: "2026-10-03T14:48:11Z"},
+		{PR: "41", Commit: "sha-41", CommittedDate: "2026-10-04T07:52:31Z"},
+	}
+
+	// Both PRs already have an established baseline from a prior check,
+	// carried on the bookkeeping version — not tied to either PR being
+	// "the cursor."
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: map[string]int64{"39": 100, "41": 200},
+		},
+	}
+
+	versions, err := applyCommentTriggers(
+		context.Background(), request, gc, []*models.PullRequest{pr39, pr41}, baseVersions, DefaultCheckConcurrency,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var pr39Fired, pr41Fired bool
+	for _, v := range versions {
+		switch {
+		case v.PR == "39" && v.CommentID == 201:
+			pr39Fired = true
+		case v.PR == "41" && v.CommentID == 202:
+			pr41Fired = true
+		}
+	}
+	if !pr39Fired {
+		t.Errorf("PR #39's comment trigger did not fire: %+v", versions)
+	}
+	if !pr41Fired {
+		t.Errorf("PR #41's comment trigger did not fire: %+v", versions)
 	}
 }
 
@@ -355,7 +477,9 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	gc := newTestGithubClient(t, mux)
 
 	pr := &models.PullRequest{Number: 42, HeadRefOID: "abc123", CommittedDate: "2026-01-01T00:00:00Z"}
-	prevVersion := &models.Version{PR: "42", Commit: "abc000", CommentID: 100, CommentBaseline: true}
+	// The baseline lives on the bookkeeping version (sentinelPR), not on
+	// any real PR's own version.
+	prevVersion := &models.Version{PR: sentinelPR, CommentBaseline: true, CommentWatermarks: map[string]int64{"42": 100}}
 	request := CheckRequest{
 		Source:  Source{CommonConfig: gc.Config},
 		Version: prevVersion,
@@ -365,18 +489,31 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(versions) != 1 {
-		t.Fatalf("expected exactly one triggered version, got %d: %+v", len(versions), versions)
+	if len(versions) != 2 {
+		t.Fatalf("expected the triggered version plus the bookkeeping version, got %d: %+v", len(versions), versions)
 	}
-	if versions[0].CommentID != 555 {
-		t.Errorf("CommentID = %d, want 555", versions[0].CommentID)
+	triggered := versions[0]
+	if triggered.CommentID != 555 {
+		t.Errorf("CommentID = %d, want 555", triggered.CommentID)
 	}
-	if versions[0].PR != "42" || versions[0].Commit != "abc123" {
-		t.Errorf("triggered version = %+v, want PR 42 at current HEAD abc123", versions[0])
+	if triggered.PR != "42" || triggered.Commit != "abc123" {
+		t.Errorf("triggered version = %+v, want PR 42 at current HEAD abc123", triggered)
+	}
+	sentinel := versions[1]
+	if sentinel.PR != sentinelPR || sentinel.CommentWatermarks["42"] != 555 {
+		t.Errorf("bookkeeping version = %+v, want CommentWatermarks[\"42\"] = 555", sentinel)
 	}
 }
 
-func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.T) {
+// TestApplyCommentTriggers_NonSentinelVersion_TreatsAsNoBaseline covers the
+// one-time migration case: right after upgrading from a version of this
+// resource that predates the comment-trigger bookkeeping version,
+// request.Version is still some real PR's own version, not the sentinel.
+// Since watermarks are only ever read from the sentinel, no PR has an
+// established baseline yet — not even the PR request.Version happens to
+// be about — until the bookkeeping version this check appends establishes
+// one for the future.
+func TestApplyCommentTriggers_NonSentinelVersion_TreatsAsNoBaseline(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `[{"id": 555, "body": "concourse plan"}]`)
@@ -384,10 +521,7 @@ func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.
 	gc := newTestGithubClient(t, mux)
 
 	pr := &models.PullRequest{Number: 42, HeadRefOID: "abc123", CommittedDate: "2026-01-01T00:00:00Z"}
-	// The cursor currently points at a different PR (#7), so PR #42's own
-	// comment watermark is unknown — this is the documented best-effort
-	// limitation of list mode.
-	prevVersion := &models.Version{PR: "7", Commit: "def456", CommentID: 900, CommentBaseline: true}
+	prevVersion := &models.Version{PR: "42", Commit: "abc000", CommentID: 900, CommentBaseline: true}
 	request := CheckRequest{
 		Source:  Source{CommonConfig: gc.Config},
 		Version: prevVersion,
@@ -397,8 +531,16 @@ func TestApplyCommentTriggers_CursorOnDifferentPR_TreatsAsNoBaseline(t *testing.
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(versions) != 0 {
-		t.Fatalf("expected no triggered version when the cursor is on a different PR, got %d: %+v", len(versions), versions)
+	for _, v := range versions {
+		if v.PR == "42" {
+			t.Fatalf("PR #42 triggered even though request.Version wasn't the bookkeeping version: %+v", versions)
+		}
+	}
+	if len(versions) != 1 || versions[0].PR != sentinelPR {
+		t.Fatalf("expected exactly the bookkeeping version, got %+v", versions)
+	}
+	if versions[0].CommentWatermarks["42"] != 555 {
+		t.Errorf("bookkeeping CommentWatermarks[\"42\"] = %d, want 555 (establishing baseline)", versions[0].CommentWatermarks["42"])
 	}
 }
 
@@ -426,13 +568,13 @@ func TestApplyCommentTriggers_ClosingOnePRNeverPerturbsAnother(t *testing.T) {
 		{PR: "41", Commit: "3f1d91c719", CommittedDate: "2026-10-04T07:52:31Z"},
 	}
 
-	// PR #39 is the cursor with an already-established baseline; PR #41's
-	// comment (5978113103) is brand new to this run, but PR #41 was never
-	// the cursor, so it must not fire — just establish its own baseline.
+	// Both PR #39 and PR #41 already have an established baseline, carried
+	// on the bookkeeping version — not on either PR's own version.
 	request := CheckRequest{
 		Source: Source{CommonConfig: gc.Config},
 		Version: &models.Version{
-			PR: "39", Commit: "abdabec5fd", CommentID: 5977983085, CommentBaseline: true,
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: map[string]int64{"39": 5977983085, "41": 5978113103},
 		},
 	}
 
@@ -471,7 +613,7 @@ func TestApplyCommentTriggers_ClosingOnePRNeverPerturbsAnother(t *testing.T) {
 		}
 	}
 
-	if pr39Before != pr39After {
+	if !reflect.DeepEqual(pr39Before, pr39After) {
 		t.Errorf("PR #39's version changed after PR #41 closed:\nbefore: %+v\nafter:  %+v", pr39Before, pr39After)
 	}
 }
@@ -532,8 +674,11 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 	}
 
 	request := CheckRequest{
-		Source:  Source{CommonConfig: gc.Config},
-		Version: &models.Version{PR: strconv.Itoa(cursorPR), CommentID: 100, CommentBaseline: true},
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: map[string]int64{strconv.Itoa(cursorPR): 100},
+		},
 	}
 
 	versions, err := applyCommentTriggers(context.Background(), request, gc, prs, preExisting, DefaultCheckConcurrency)
@@ -541,10 +686,11 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// No extra versions are appended: cursorPR was already present among
-	// the base versions, so its trigger is reflected in place.
-	if len(versions) != n {
-		t.Fatalf("got %d versions, want exactly %d (no extra appends expected): %+v", len(versions), n, versions)
+	// No extra PR versions are appended: cursorPR was already present
+	// among the base versions, so its trigger is reflected in place. Only
+	// the bookkeeping version is added on top.
+	if len(versions) != n+1 {
+		t.Fatalf("got %d versions, want exactly %d (n base versions + 1 bookkeeping): %+v", len(versions), n+1, versions)
 	}
 
 	// Every PR's own entry must carry its own freshly observed comment id
@@ -562,6 +708,22 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		wantCommentID := int64(1000 + number)
 		if v.CommentID != wantCommentID {
 			t.Errorf("PR #%d: CommentID = %d, want %d", number, v.CommentID, wantCommentID)
+		}
+	}
+
+	// The bookkeeping version carries every PR's own freshly observed
+	// comment id — not just cursorPR's — so each one's baseline is
+	// recoverable on a future check regardless of which PR cursorPR ends
+	// up being next.
+	sentinel := versions[n]
+	if sentinel.PR != sentinelPR {
+		t.Fatalf("versions[%d].PR = %s, want sentinel %s (order not preserved)", n, sentinel.PR, sentinelPR)
+	}
+	for i := range n {
+		number := i + 1
+		wantCommentID := int64(1000 + number)
+		if got := sentinel.CommentWatermarks[strconv.Itoa(number)]; got != wantCommentID {
+			t.Errorf("bookkeeping CommentWatermarks[%q] = %d, want %d", strconv.Itoa(number), got, wantCommentID)
 		}
 	}
 }
@@ -867,6 +1029,13 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 		// The latest push only touched the bootstrap YAML, outside paths.
 		_, _ = fmt.Fprint(w, `{"files": [{"filename": "concourse-config-bootstrap-staging.yaml"}]}`)
 	})
+	// request.Version is now the bookkeeping version (not PR #5's own), so
+	// filterPRsByPath has no sinceSHA for PR #5 and falls back to the full
+	// diff endpoint instead of the scoped compare above — mock it the same
+	// way so the test exercises "doesn't match paths" either way.
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"filename": "concourse-config-bootstrap-staging.yaml"}]`)
+	})
 	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", prNumber), func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}]`, newCommentID)
 	})
@@ -893,10 +1062,9 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 	request := CheckRequest{
 		Source: Source{CommonConfig: gc.Config},
 		Version: &models.Version{
-			PR:              strconv.Itoa(prNumber),
-			Commit:          oldSHA,
-			CommentID:       oldCommentID,
-			CommentBaseline: true,
+			PR:                sentinelPR,
+			CommentBaseline:   true,
+			CommentWatermarks: map[string]int64{strconv.Itoa(prNumber): oldCommentID},
 		},
 	}
 
@@ -922,25 +1090,24 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 	}
 }
 
-// TestCheck_CommentTrigger_CursorMovedAway_ReEstablishesBaselineInsteadOfFiring
-// documents the accepted trade-off of per-PR-only comment-trigger tracking
-// (no shared, multi-PR watermark table): Concourse's check protocol only
-// ever hands back the single version it considers "latest," so a PR's
-// comment-trigger baseline survives only while it keeps being that
-// version. Here PR #20 is the cursor; PR #5 has no baseline of its own
-// recorded anywhere reachable from request.Version, even though it had one
-// established previously (back when IT was the cursor). A matching comment
-// on PR #5 must NOT fire a build — it only (re-)establishes PR #5's
-// baseline, which fires on the comment after this one.
+// TestCheck_CommentTrigger_NonSentinelLastVersion_ReEstablishesBaseline
+// covers the one-time migration edge case: request.Version is some real
+// PR's own version (here, PR #20's), not the bookkeeping version. This can
+// only happen right after upgrading from a version of this resource that
+// predates the bookkeeping version, or on the very first-ever check — in
+// steady-state operation, applyCommentTriggers always appends the
+// bookkeeping version last, so it's always what Concourse remembers as
+// "latest" from the second check onward, and every tracked PR's baseline
+// (including PR #5's here) is always reliably recoverable from it
+// regardless of which PR last got a new commit.
 //
-// An earlier design tried to carry every tracked PR's watermark forward in
-// one table embedded in every version, specifically to make this fire
-// instead. It caused a worse problem: confirmed live against a running
-// pipeline, one PR's watermark changing — including just that PR closing —
-// made every OTHER open PR's version look different too, spuriously
-// rebuilding already-built commits. This occasional, self-healing miss is
-// the accepted cost of avoiding that.
-func TestCheck_CommentTrigger_CursorMovedAway_ReEstablishesBaselineInsteadOfFiring(t *testing.T) {
+// Since watermarks are only ever read from the bookkeeping version,
+// request.Version being PR #20's own version instead means NO PR has a
+// recoverable baseline this check — including PR #5, even though PR #5 had
+// one established previously. Its matching comment must NOT fire a build
+// here; it only (re-)establishes PR #5's baseline on the freshly appended
+// bookkeeping version, which fires on the comment after this one.
+func TestCheck_CommentTrigger_NonSentinelLastVersion_ReEstablishesBaseline(t *testing.T) {
 	const prA = 5
 	const prASHA = "aaa111"
 	const oldCommentID = 100

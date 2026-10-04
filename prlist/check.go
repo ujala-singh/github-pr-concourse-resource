@@ -20,6 +20,14 @@ import (
 // CommonConfig.CheckConcurrency for the configurable override.
 const DefaultCheckConcurrency = 10
 
+// sentinelPR is a reserved version PR value — never a real GitHub PR
+// number, which are always >= 1 — used for the dedicated bookkeeping
+// version applyCommentTriggers appends to carry the comment-trigger
+// watermark table forward across checks. prlist.In and the pipeline's own
+// task script both need to recognize this value and skip real work for
+// it; see applyCommentTriggers and In.
+const sentinelPR = "0"
+
 // resolveCheckConcurrency returns the effective concurrency bound for a
 // check: the configured source.check_concurrency if set (validated to be
 // in [1, 50] by CommonConfig.Validate), otherwise DefaultCheckConcurrency.
@@ -72,8 +80,12 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 
 	// If nothing currently matches (e.g. no open PRs touch the configured
 	// paths), echo back the last known version so the resource doesn't
-	// appear to lose its place.
-	if len(versions) == 0 && request.Version != nil {
+	// appear to lose its place. Never echo the comment-trigger bookkeeping
+	// version this way — applyCommentTriggers below always appends a
+	// fresh one of its own when trigger_comments is set, so echoing the
+	// old one here would just add a second, stale "PR" == sentinelPR
+	// entry alongside it.
+	if len(versions) == 0 && request.Version != nil && request.Version.PR != sentinelPR {
 		versions = []models.Version{*request.Version}
 	}
 
@@ -156,27 +168,31 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // matching source.trigger_comments, stamping the latest match onto that
 // PR's own already-present version (if any) and appending an extra
 // version for any PR that genuinely triggered but isn't otherwise part of
-// this check's output (its latest push doesn't match source.paths).
+// this check's output (its latest push doesn't match source.paths). It
+// also always appends a dedicated bookkeeping version (PR == sentinelPR)
+// carrying every tracked PR's watermark forward, so a later check can
+// recover any PR's own prior watermark regardless of which real PR's
+// version Concourse happens to remember as "latest" in between.
 //
-// Each PR's CommentID/CommentBaseline describes only that one PR — there
-// is no shared, multi-PR watermark table. Concourse's check protocol only
-// ever hands back the single version it considers "latest," so a PR's
-// comment-trigger baseline only survives while it keeps being that
-// "latest" version; if the cursor moves to a different PR for a while, a
-// later comment on this one is treated as establishing a fresh baseline
-// rather than firing (see models.Version.CommentBaseline). An earlier
-// design tried to carry every tracked PR's watermark forward in one table
-// embedded in every version, specifically to survive that gap. It caused
-// a worse problem instead, confirmed live against a running pipeline: one
-// PR's watermark changing — including just that PR closing — made every
-// OTHER open PR's version look different too, spuriously rebuilding
-// already-built commits. Occasionally losing a baseline is a smaller,
-// self-healing cost (the very next matching comment establishes a new
-// one) than that.
+// A real PR's own CommentID/CommentBaseline still describes only that one
+// PR — nothing about PR B's version ever depends on PR A's data — so
+// those fields are never perturbed by another PR's activity, including
+// that PR closing. Two earlier designs got this wrong in different ways:
+// one embedded a shared, multi-PR table directly on every real PR's
+// version (any PR's watermark changing made every other one look new and
+// rebuilt its already-built commit); the other dropped the shared table
+// entirely in favor of a single implicit cursor (request.Version.PR),
+// which meant commenting on two different PRs within the same check
+// window silently dropped whichever one wasn't already the cursor.
+// Confining the shared table to one dedicated, non-PR version avoids
+// both: only the bookkeeping version's own (cheap, no-op) build is
+// affected when the table changes, and every PR's watermark is always
+// reliably recoverable from it. The pipeline's own task script needs to
+// recognize sentinelPR and skip real work for it — see prlist.In.
 func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
-	cursorPR := ""
-	if request.Version != nil {
-		cursorPR = request.Version.PR
+	var tracked map[string]int64
+	if request.Version != nil && request.Version.PR == sentinelPR {
+		tracked = request.Version.CommentWatermarks
 	}
 
 	type result struct {
@@ -196,12 +212,7 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	runBounded(len(allPRs), concurrency, func(i int) {
 		pr := allPRs[i]
 		prKey := strconv.Itoa(pr.Number)
-		baselineEstablished := cursorPR == prKey && request.Version.CommentBaseline
-
-		var sinceID int64
-		if baselineEstablished {
-			sinceID = request.Version.CommentID
-		}
+		sinceID, baselineEstablished := tracked[prKey]
 
 		latestMatchID, triggered, err := github.CheckTriggerComments(ctx, pr.Number, request.Source.TriggerComments, sinceID)
 		if err != nil {
@@ -221,8 +232,11 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	}
 
 	byPR := make(map[string]result, len(results))
+	newTable := make(map[string]int64, len(results))
 	for _, r := range results {
-		byPR[strconv.Itoa(r.pr.Number)] = r
+		prKey := strconv.Itoa(r.pr.Number)
+		byPR[prKey] = r
+		newTable[prKey] = r.latestMatchID
 	}
 
 	// Stamp each PR's own, freshly observed comment state onto its own
@@ -266,6 +280,17 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			CommentBaseline:     true,
 		})
 	}
+
+	// Always appended last, so it's the version Concourse remembers as
+	// "latest" for the next check — guaranteeing newTable (this cycle's
+	// complete, freshly pruned-to-currently-open-PRs table) is always
+	// recoverable next time, regardless of which real PR's version ends
+	// up being the one humans look at in the UI.
+	versions = append(versions, models.Version{
+		PR:                sentinelPR,
+		CommentBaseline:   true,
+		CommentWatermarks: newTable,
+	})
 
 	return versions, nil
 }

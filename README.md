@@ -261,8 +261,19 @@ source:
 
 Commenting `concourse plan` (case-insensitive, prefix match) on the PR causes the next `check` to emit a new version for that PR's **current HEAD** — not the commit that existed when the comment was posted. This works the same way in both modes:
 
-- **Single PR mode** (`number` set): tracks that one PR's comment watermark directly.
-- **PR list mode** (`number` unset): tracks each PR's comment watermark **independently** — a PR's `comment_id`/`comment_baseline` describes only that PR, never any other. Concourse's check protocol only ever hands this resource back the single version it considers "latest" — there's no API to ask "what did you last see for PR #20 specifically." Because of that, a PR's watermark only survives while it keeps being that "latest" version; if the cursor moves to a different PR for a while (e.g. because that other PR got a new commit), a later comment on this one is treated as establishing a fresh baseline rather than firing — self-healing on the comment after that. An earlier version of this resource tried to carry every tracked PR's watermark forward in one shared table embedded in every version, specifically to avoid that gap. It caused a worse problem instead, confirmed in production: one PR's watermark changing — including just that PR closing — made every *other* open PR's version look different too, spuriously rebuilding already-built commits. Occasionally missing a comment trigger when the cursor has moved away is a smaller, self-correcting cost than that.
+- **Single PR mode** (`number` set): tracks that one PR's comment watermark directly, on the resource's own version. No extra setup needed.
+- **PR list mode** (`number` unset): tracks every PR's comment watermark independently via a dedicated **bookkeeping version** — a reserved version with `pr: "0"`, which never corresponds to a real PR. Concourse's check protocol only ever hands this resource back the single version it considers "latest," so tracking *multiple* PRs' watermarks reliably requires something to carry all of them forward regardless of which real PR's version that happens to be; the bookkeeping version is that something. A real PR's own `comment_id`/`comment_baseline` still describes only that PR — nothing about one PR's version ever depends on another's — so a PR closing, or getting a new comment, never perturbs any other PR's version. Only the bookkeeping version's own build is affected when the table changes.
+
+  **This means `pr-plan`-style jobs in PR list mode must recognize and skip the bookkeeping version.** The resource's `in` step writes a `COMMENT_TRIGGER_BOOKKEEPING` marker file at the root of the fetched directory instead of checking out a repository for it (there is no repository to check out — it's not a real PR). Add an early exit to your task script:
+
+  ```bash
+  if [ -f pull-request/COMMENT_TRIGGER_BOOKKEEPING ]; then
+    echo "bookkeeping version, nothing to plan"
+    exit 0
+  fi
+  ```
+
+  You'll see one extra, fast no-op build in the Concourse UI each time the watermark table changes (a new matching comment on any tracked PR, or a tracked PR closing) — this is expected and is the cost of reliable multi-PR comment-trigger tracking under Concourse's single-version-cursor protocol.
 
 The very first `trigger_comments`-eligible check for a PR (or the first check after upgrading to a version of this resource that supports it) only establishes the watermark — it won't retroactively fire on comments that already existed before the pipeline started watching for them.
 
@@ -281,7 +292,7 @@ The very first `trigger_comments`-eligible check for a PR (or the first check af
 
 **Single PR Mode**: Returns list of commits to the specified PR. A new version is emitted for each new commit, or (if `trigger_comments` is set) for a matching comment.
 
-> Every version this resource returns carries extra fields you'll see in Concourse's resource-version listing whenever `trigger_comments` is configured: `comment_id` and `comment_baseline`. These are an internal watermark, not a log of every comment ever posted — `comment_id` is just the highest matching-comment ID seen so far *for that version's own PR*, and `comment_baseline` marks that the watermark has been established at least once. They show up on ordinary commit-triggered versions too (not just comment-triggered ones) because the resource needs this watermark carried forward on every version to correctly detect the *next* new comment on that same PR. If you don't set `trigger_comments`, neither field appears.
+> Every version this resource returns carries extra fields you'll see in Concourse's resource-version listing whenever `trigger_comments` is configured: `comment_id` and `comment_baseline`. These are an internal watermark, not a log of every comment ever posted — `comment_id` is just the highest matching-comment ID seen so far *for that version's own PR*, and `comment_baseline` marks that the watermark has been established at least once. They show up on ordinary commit-triggered versions too (not just comment-triggered ones) because the resource needs this watermark carried forward on every version to correctly detect the *next* new comment on that same PR. If you don't set `trigger_comments`, neither field appears. In PR list mode, you'll additionally see one dedicated version per check with `pr: "0"` and a `comment_watermarks` field (a JSON object mapping every tracked PR number to its own watermark) — see [Comment Triggers](#comment-triggers) for why, and what your task script needs to do about it.
 
 ### Path Filtering and Diff Scope
 
