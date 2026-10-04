@@ -219,13 +219,22 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // ever hands back the one version it considers "latest," not a per-PR
 // history, so earlier versions of this function could only reliably track
 // whichever single PR that version happened to be about. By folding every
-// tracked PR's watermark into one map and stamping the complete, current
-// map onto every version this function returns, the table survives
-// regardless of which PR Concourse remembers as "latest" next — removing
-// that limitation. allPRs (every currently open, Github-API-matching PR,
-// not just path-filtered ones) is used only to prune entries for PRs that
-// have closed/merged/dropped out, bounding the map to roughly the current
-// open-PR count rather than growing forever.
+// tracked PR's watermark into one map and carrying the complete, current
+// table forward on whichever version Concourse ends up remembering as
+// "latest" next, the table survives regardless of which PR that happens
+// to be about — removing that limitation.
+//
+// allPRs (every currently open, GitHub-API-matching PR, not just
+// path-filtered ones) is used to prune entries for PRs that have
+// closed/merged/dropped out, bounding the map to roughly the current
+// open-PR count rather than growing forever — but that pruning is only
+// ever applied on a cycle where something else already makes a version
+// new (a genuine trigger, or a PR entering tracked scope for the first
+// time), never on its own. See the comment above the usePruned
+// computation below for why: eagerly changing the table's content purely
+// because some OTHER PR closed, while every version carried the full
+// table, used to make Concourse rebuild every open PR's already-built
+// commit the moment any one of them closed.
 func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, scopePRs []*models.PullRequest, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
 	tracked := commentWatermarks(request.Version)
 
@@ -263,42 +272,28 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		}
 	}
 
-	// Build the updated watermark table: start from whatever was already
-	// tracked, drop entries for PRs no longer open (the pruning that keeps
-	// this bounded), then overlay fresh results for everything just
-	// scanned.
-	openPRs := make(map[string]bool, len(allPRs))
-	for _, pr := range allPRs {
-		openPRs[strconv.Itoa(pr.Number)] = true
-	}
-	newWatermarks := make(map[string]int64, len(scopePRs))
-	for prKey, id := range tracked {
-		if openPRs[prKey] {
-			newWatermarks[prKey] = id
-		}
-	}
+	// Grow-only overlay of the tracked table with this cycle's scan
+	// results. This alone never removes anything, so a value here only
+	// differs from tracked[prKey] in two cases: a real trigger fired for
+	// an already-tracked PR (handled below — that PR's own triggered
+	// entry is a genuinely new version regardless), or prKey is entering
+	// tracked scope for the first time. The second case always coincides
+	// with that PR's OWN (pr, commit) version also being new — it's never
+	// been returned before — so there's always an independently-new place
+	// to carry it, never a need to perturb an unrelated, unchanged PR.
+	overlaid := make(map[string]int64, len(tracked)+len(scopePRs))
+	maps.Copy(overlaid, tracked)
 	for i, pr := range scopePRs {
-		newWatermarks[strconv.Itoa(pr.Number)] = results[i].latestMatchID
+		overlaid[strconv.Itoa(pr.Number)] = results[i].latestMatchID
 	}
 
-	// Only stamp the watermark table onto an EXISTING (already
-	// about-to-be-returned) version when the table actually changed and
-	// nothing else already makes a version new this cycle to carry it on.
-	// Stamping it onto every version unconditionally — the previous
-	// behavior — made an unrelated PR's merge (which prunes that PR's
-	// entry out of the table above) change the comment_watermarks blob on
-	// every OTHER open PR's version too, even though those PRs' own
-	// commits and comments never changed. Concourse's ATC compares the
-	// whole version map for equality, so that alone made every one of
-	// them look like a brand-new version and spuriously rebuilt their
-	// already-built commits. A PR that actually triggered this cycle
-	// already gets the table attached below (it's a genuinely new version
-	// regardless), so it only needs a carrier here when nothing already
-	// triggered. The chosen carrier is restricted to a still-open PR —
-	// never the fallback echo of an already-merged/closed PR's last known
-	// version — so pruning a closed PR's entry can, at worst, cause one
-	// still-open PR to rebuild its unchanged commit, instead of resurrecting
-	// a dead PR's old commit or (the original bug) rebuilding every open PR.
+	newKeys := make(map[string]bool)
+	for prKey := range overlaid {
+		if _, existed := tracked[prKey]; !existed {
+			newKeys[prKey] = true
+		}
+	}
+
 	anyTriggered := false
 	for _, r := range results {
 		if r.triggered {
@@ -306,14 +301,56 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			break
 		}
 	}
-	if !maps.Equal(tracked, newWatermarks) && !anyTriggered && len(versions) > 0 {
-		last := len(versions) - 1
-		if openPRs[versions[last].PR] {
-			versions[last].CommentBaseline = true
-			versions[last].CommentWatermarks = newWatermarks
-			if id, ok := newWatermarks[versions[last].PR]; ok {
-				versions[last].CommentID = id
+
+	// Dropping PRs that closed/merged out of the table is deferred until a
+	// cycle where something else ALREADY makes a version new (a genuine
+	// trigger, or a newKeys PR's own first-ever version) — never performed
+	// on its own. Pruning eagerly, every check regardless, was the bug:
+	// since it changes the table's content purely because some OTHER PR
+	// closed, and the table used to get stamped onto every returned
+	// version, Concourse's ATC (which compares the whole version map for
+	// equality) saw every other open, completely unchanged PR as a new
+	// version and rebuilt their already-built commits. Deferring costs
+	// nothing but a few stale entries lingering in the table a bit longer
+	// — bounded by how long it takes before any real activity happens
+	// again, at which point that activity's own new version absorbs the
+	// prune for free.
+	usePruned := anyTriggered || len(newKeys) > 0
+	newWatermarks := overlaid
+	if usePruned {
+		openPRs := make(map[string]bool, len(allPRs))
+		for _, pr := range allPRs {
+			openPRs[strconv.Itoa(pr.Number)] = true
+		}
+		pruned := make(map[string]int64, len(overlaid))
+		for prKey, id := range overlaid {
+			if openPRs[prKey] {
+				pruned[prKey] = id
 			}
+		}
+		newWatermarks = pruned
+	}
+
+	// When nothing triggered this cycle, a triggered entry (appended
+	// below, always last) isn't available to carry the table forward —
+	// fall back to one of the newKeys PRs' own base versions instead,
+	// moving it last so it's the one Concourse remembers as "latest" next.
+	// usePruned guarantees at least one exists whenever this runs: it's
+	// only true here because len(newKeys) > 0 (anyTriggered is false in
+	// this branch).
+	if usePruned && !anyTriggered {
+		for j := range versions {
+			if !newKeys[versions[j].PR] {
+				continue
+			}
+			versions[j].CommentBaseline = true
+			versions[j].CommentWatermarks = newWatermarks
+			if id, ok := newWatermarks[versions[j].PR]; ok {
+				versions[j].CommentID = id
+			}
+			last := len(versions) - 1
+			versions[j], versions[last] = versions[last], versions[j]
+			break
 		}
 	}
 
