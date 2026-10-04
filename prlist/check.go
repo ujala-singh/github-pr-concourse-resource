@@ -367,6 +367,22 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			// is the only way to persist the table without ever risking
 			// that — it's the sole new thing this cycle, so it's safe for
 			// it to be last.
+			//
+			// Except on this resource's very first-ever check
+			// (request.Version == nil) when real PR entries are ALSO
+			// present: Concourse always starts a brand-new resource from
+			// whatever check returns as its LAST array element, even with
+			// version: every — confirmed live — so appending the sentinel
+			// after a real PR's first-ever entry would make Concourse
+			// treat THAT entry as pre-existing history to skip, not build,
+			// exactly as it deliberately does for a freshly added
+			// git-resource with 1000 existing commits. Skipping the
+			// sentinel here costs nothing: there's no prior table to lose
+			// on a cold start, and the very next check — no longer a cold
+			// start — can safely record it via the normal paths above.
+			if request.Version == nil && len(versions) > 0 {
+				return versions, nil
+			}
 			versions = append(versions, models.Version{
 				PR:                sentinelPR,
 				CommentBaseline:   true,
