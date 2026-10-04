@@ -3,6 +3,7 @@ package prlist
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"sync"
 
@@ -280,15 +281,39 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		newWatermarks[strconv.Itoa(pr.Number)] = results[i].latestMatchID
 	}
 
-	// Stamp the full, current watermark table onto every version in this
-	// batch, so whichever one Concourse remembers as "latest" next carries
-	// every tracked PR's watermark forward — not just the one PR that
-	// version happens to be about.
-	for j := range versions {
-		versions[j].CommentBaseline = true
-		versions[j].CommentWatermarks = newWatermarks
-		if id, ok := newWatermarks[versions[j].PR]; ok {
-			versions[j].CommentID = id
+	// Only stamp the watermark table onto an EXISTING (already
+	// about-to-be-returned) version when the table actually changed and
+	// nothing else already makes a version new this cycle to carry it on.
+	// Stamping it onto every version unconditionally — the previous
+	// behavior — made an unrelated PR's merge (which prunes that PR's
+	// entry out of the table above) change the comment_watermarks blob on
+	// every OTHER open PR's version too, even though those PRs' own
+	// commits and comments never changed. Concourse's ATC compares the
+	// whole version map for equality, so that alone made every one of
+	// them look like a brand-new version and spuriously rebuilt their
+	// already-built commits. A PR that actually triggered this cycle
+	// already gets the table attached below (it's a genuinely new version
+	// regardless), so it only needs a carrier here when nothing already
+	// triggered. The chosen carrier is restricted to a still-open PR —
+	// never the fallback echo of an already-merged/closed PR's last known
+	// version — so pruning a closed PR's entry can, at worst, cause one
+	// still-open PR to rebuild its unchanged commit, instead of resurrecting
+	// a dead PR's old commit or (the original bug) rebuilding every open PR.
+	anyTriggered := false
+	for _, r := range results {
+		if r.triggered {
+			anyTriggered = true
+			break
+		}
+	}
+	if !maps.Equal(tracked, newWatermarks) && !anyTriggered && len(versions) > 0 {
+		last := len(versions) - 1
+		if openPRs[versions[last].PR] {
+			versions[last].CommentBaseline = true
+			versions[last].CommentWatermarks = newWatermarks
+			if id, ok := newWatermarks[versions[last].PR]; ok {
+				versions[last].CommentID = id
+			}
 		}
 	}
 
