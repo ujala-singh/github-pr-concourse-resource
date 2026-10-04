@@ -262,9 +262,11 @@ source:
 Commenting `concourse plan` (case-insensitive, prefix match) on the PR causes the next `check` to emit a new version for that PR's **current HEAD** — not the commit that existed when the comment was posted. This works the same way in both modes:
 
 - **Single PR mode** (`number` set): tracks that one PR's comment watermark directly, on the resource's own version. No extra setup needed.
-- **PR list mode** (`number` unset): tracks every PR's comment watermark independently via a dedicated **bookkeeping version** — a reserved version with `pr: "0"`, which never corresponds to a real PR. Concourse's check protocol only ever hands this resource back the single version it considers "latest," so tracking *multiple* PRs' watermarks reliably requires something to carry all of them forward regardless of which real PR's version that happens to be; the bookkeeping version is that something. A real PR's own `comment_id`/`comment_baseline` still describes only that PR — nothing about one PR's version ever depends on another's — so a PR closing, or getting a new comment, never perturbs any other PR's version. Only the bookkeeping version's own build is affected when the table changes.
+- **PR list mode** (`number` unset): tracks every PR's comment watermark independently via a shared table (a PR number -> comment ID map) that survives regardless of which real PR's version Concourse happens to remember as "latest" in between checks. A real PR's own `comment_id`/`comment_baseline` still describes only that PR — nothing about one PR's version ever depends on another's — so a PR closing, or getting a new comment, never perturbs any other PR's version.
 
-  **This means `pr-plan`-style jobs in PR list mode must recognize and skip the bookkeeping version.** The resource's `in` step writes a `COMMENT_TRIGGER_BOOKKEEPING` marker file at the root of the fetched directory instead of checking out a repository for it (there is no repository to check out — it's not a real PR). Add an early exit to your task script:
+  The table only needs recording when it actually changes, and even then it's attached to whichever version is *already* new that cycle for its own reason (a real comment trigger, or a brand-new PR's first-ever version) — never to an otherwise-unrelated, stable PR's version. Only when nothing else is changing that cycle (e.g. a PR merged and that's the only thing that happened) does the resource fall back to a dedicated **bookkeeping version** — a reserved version with `pr: "0"`, which never corresponds to a real PR — purely to carry the table forward.
+
+  **This means `pr-plan`-style jobs in PR list mode must recognize and skip the bookkeeping version when one does show up.** The resource's `in` step writes a `COMMENT_TRIGGER_BOOKKEEPING` marker file at the root of the fetched directory instead of checking out a repository for it (there is no repository to check out — it's not a real PR). Add an early exit to your task script:
 
   ```bash
   if [ -f pull-request/COMMENT_TRIGGER_BOOKKEEPING ]; then
@@ -273,7 +275,9 @@ Commenting `concourse plan` (case-insensitive, prefix match) on the PR causes th
   fi
   ```
 
-  You'll see one extra, fast no-op build in the Concourse UI each time the watermark table changes (a new matching comment on any tracked PR, or a tracked PR closing) — this is expected and is the cost of reliable multi-PR comment-trigger tracking under Concourse's single-version-cursor protocol.
+  You'll occasionally see one extra, fast no-op build in the Concourse UI — specifically when a tracked PR closes/merges with no other comment-trigger activity that same check — but not on every table change; most of the time the table simply rides along on whatever version was already going to be new.
+
+  **Do not use `try:` to make that no-op build show green.** It's tempting, but `try:` masks the failure of its *entire* wrapped scope with success — wrapping a real `put` (e.g. to a `tofu`/terraform resource) in `try:` to "skip it gracefully" would also silently mask genuine plan/apply failures as green. Use `load_var` + `across` instead: have a task always succeed and write an empty list (or a single-element list) to a file based on the marker, `load_var` it, then wrap the real work in `across: { values: ((.:the_var)) }` — the real work then runs zero times (a trivial, immediate success) for the bookkeeping version, or once for a real PR, with no risk of masking a real failure. See [concourse/concourse#7521](https://github.com/concourse/concourse/discussions/7521) for why `try:` is unsafe here.
 
 The very first `trigger_comments`-eligible check for a PR (or the first check after upgrading to a version of this resource that supports it) only establishes the watermark — it won't retroactively fire on comments that already existed before the pipeline started watching for them.
 

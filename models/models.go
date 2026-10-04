@@ -256,22 +256,31 @@ type Version struct {
 	// that one PR — changing a comment on PR A can never perturb PR B's
 	// version, since nothing about PR B's version depends on PR A's data.
 	CommentBaseline bool `json:"-"`
-	// CommentWatermarks is set ONLY on prlist (list) mode's dedicated
-	// bookkeeping version (PR == a reserved sentinel, never a real GitHub
-	// PR number — see prlist.sentinelPR) — never on a real PR's own
-	// version. It's a PR-number -> highest-matching-comment-ID table for
-	// every currently tracked PR, there purely so a later check can
-	// recover every PR's own comment watermark regardless of which
-	// version Concourse happens to remember as "latest" in between
-	// (Concourse's check protocol only ever hands back that one version,
-	// not a per-PR history). An earlier design embedded this same table
-	// directly on every real PR's version to solve that same problem; it
-	// caused a worse one instead — one PR's watermark changing (even just
-	// that PR closing) made every OTHER open PR's version look different
-	// too, spuriously rebuilding already-built commits. Confining the
-	// table to one dedicated, non-PR version isolates that churn: only
-	// the bookkeeping version's own build (a cheap no-op on the pipeline
-	// side) is affected when the table changes, never a real PR's.
+	// CommentWatermarks is prlist (list) mode's PR-number ->
+	// highest-matching-comment-ID table for every currently tracked PR,
+	// there purely so a later check can recover every PR's own comment
+	// watermark regardless of which version Concourse happens to remember
+	// as "latest" in between (Concourse's check protocol only ever hands
+	// back that one version, not a per-PR history).
+	//
+	// It's nil on the vast majority of versions — it's only ever attached
+	// to one version per check, and only on checks where the table
+	// actually changed, to the entry that's ALREADY independently new
+	// that cycle for its own reason (a real trigger, or a brand-new PR's
+	// first-ever version). When nothing else is changing, it falls back
+	// to prlist's dedicated bookkeeping version (PR == a reserved
+	// sentinel, never a real GitHub PR number — see prlist.sentinelPR).
+	// It is never attached to an otherwise-unrelated, unchanged PR's
+	// version. Two earlier designs got this wrong: one embedded the table
+	// on EVERY real PR's version (one PR's watermark changing, even just
+	// that PR closing, made every other open PR's version look different
+	// too, spuriously rebuilding already-built commits); another always
+	// appended a dedicated bookkeeping version LAST on every single
+	// check, which — confirmed live — permanently buried any real commit
+	// landing in the same or a later check, since Concourse re-ranks a
+	// check's last returned element as "current" ahead of everything
+	// else. Attaching it only when something changed, and preferring an
+	// already-legitimately-new entry over a standalone one, avoids both.
 	CommentWatermarks map[string]int64 `json:"-"`
 }
 

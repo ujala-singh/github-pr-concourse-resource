@@ -469,6 +469,62 @@ func TestApplyCommentTriggers_SimultaneousCommentsOnTwoPRs_BothFire(t *testing.T
 	}
 }
 
+// TestApplyCommentTriggers_PlainNewCommit_NeverTouchedByBookkeeping is the
+// definitive regression test for the bug confirmed live against a running
+// pipeline: a genuine new commit, pushed with no comment activity
+// involved, stopped triggering builds entirely. The cause was an earlier
+// design that unconditionally appended a dedicated bookkeeping version
+// LAST on every single check — Concourse treats a check's last returned
+// element as "current" and re-ranks it ahead of everything else whenever
+// it reappears, so an always-last bookkeeping entry permanently buried
+// any real commit landing in the same or a later check: the commit was
+// correctly recorded in history but never actually built.
+//
+// Here nothing about comments changes (the watermark table is already
+// exactly up to date), so applyCommentTriggers must not add or touch
+// anything beyond the plain commit-based entry already in versions.
+func TestApplyCommentTriggers_PlainNewCommit_NeverTouchedByBookkeeping(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/41/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 200, "body": "concourse plan"}]`)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr41 := &models.PullRequest{Number: 41, HeadRefOID: "new-sha", CommittedDate: "2026-10-04T09:48:26Z"}
+	// The base snapshot already reflects the new commit — this is exactly
+	// what Check's commit-based loop produces for a freshly pushed,
+	// path-matching PR, before applyCommentTriggers runs.
+	baseVersions := []models.Version{
+		{PR: "41", Commit: "new-sha", CommittedDate: "2026-10-04T09:48:26Z"},
+	}
+
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: map[string]int64{"41": 200}, // already up to date
+		},
+	}
+
+	versions, err := applyCommentTriggers(
+		context.Background(), request, gc, []*models.PullRequest{pr41}, baseVersions, DefaultCheckConcurrency,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(versions) != 1 {
+		t.Fatalf("expected exactly the plain commit-based version, nothing added, got %d: %+v", len(versions), versions)
+	}
+	v := versions[0]
+	if v.PR != "41" || v.Commit != "new-sha" {
+		t.Fatalf("version = %+v, want PR 41 at the new commit", v)
+	}
+	if v.CommentWatermarks != nil {
+		t.Errorf("CommentWatermarks = %v, want nil — a plain new commit must never carry the shared table, or it risks being buried by a later, unrelated bookkeeping update", v.CommentWatermarks)
+	}
+}
+
 func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -489,8 +545,14 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(versions) != 2 {
-		t.Fatalf("expected the triggered version plus the bookkeeping version, got %d: %+v", len(versions), versions)
+	// No separate bookkeeping version: the triggered entry is already
+	// genuinely new this cycle, so the table rides on it directly instead
+	// of a second, standalone entry — this matters because a separate
+	// trailing bookkeeping entry would bury a plain new commit landing in
+	// the same or a later check (confirmed live; see applyCommentTriggers'
+	// doc comment).
+	if len(versions) != 1 {
+		t.Fatalf("expected exactly the triggered version (table piggybacked on it), got %d: %+v", len(versions), versions)
 	}
 	triggered := versions[0]
 	if triggered.CommentID != 555 {
@@ -499,9 +561,8 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	if triggered.PR != "42" || triggered.Commit != "abc123" {
 		t.Errorf("triggered version = %+v, want PR 42 at current HEAD abc123", triggered)
 	}
-	sentinel := versions[1]
-	if sentinel.PR != sentinelPR || sentinel.CommentWatermarks["42"] != 555 {
-		t.Errorf("bookkeeping version = %+v, want CommentWatermarks[\"42\"] = 555", sentinel)
+	if triggered.CommentWatermarks["42"] != 555 {
+		t.Errorf("triggered version CommentWatermarks[\"42\"] = %d, want 555", triggered.CommentWatermarks["42"])
 	}
 }
 
@@ -686,21 +747,30 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// No extra PR versions are appended: cursorPR was already present
-	// among the base versions, so its trigger is reflected in place. Only
-	// the bookkeeping version is added on top.
-	if len(versions) != n+1 {
-		t.Fatalf("got %d versions, want exactly %d (n base versions + 1 bookkeeping): %+v", len(versions), n+1, versions)
+	// No extra versions are appended at all: cursorPR was already present
+	// among the base versions, so its trigger is reflected in place, and
+	// since it's already genuinely new this cycle, the table piggybacks
+	// directly on its entry instead of a separate bookkeeping version —
+	// moving it last in the process (see applyCommentTriggers' doc
+	// comment for why a separate, always-last bookkeeping entry is unsafe).
+	if len(versions) != n {
+		t.Fatalf("got %d versions, want exactly %d (no extra appends expected): %+v", len(versions), n, versions)
 	}
 
 	// Every PR's own entry must carry its own freshly observed comment id
 	// and an established baseline — regardless of whether it counted as
-	// "triggered" this cycle.
+	// "triggered" this cycle. Order is no longer guaranteed to match input
+	// order: the triggered PR (cursorPR) gets moved to the end to carry
+	// the table, so look each one up by PR number instead of by index.
+	byPR := make(map[string]models.Version, len(versions))
+	for _, v := range versions {
+		byPR[v.PR] = v
+	}
 	for i := range n {
 		number := i + 1
-		v := versions[i]
-		if v.PR != strconv.Itoa(number) {
-			t.Fatalf("versions[%d].PR = %s, want %d (order not preserved)", i, v.PR, number)
+		v, ok := byPR[strconv.Itoa(number)]
+		if !ok {
+			t.Fatalf("no version found for PR #%d: %+v", number, versions)
 		}
 		if !v.CommentBaseline {
 			t.Errorf("PR #%d: CommentBaseline = false, want true", number)
@@ -711,13 +781,13 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		}
 	}
 
-	// The bookkeeping version carries every PR's own freshly observed
-	// comment id — not just cursorPR's — so each one's baseline is
+	// cursorPR's entry — now the last one — carries the full watermark
+	// table for every PR, not just its own, so each one's baseline is
 	// recoverable on a future check regardless of which PR cursorPR ends
 	// up being next.
-	sentinel := versions[n]
-	if sentinel.PR != sentinelPR {
-		t.Fatalf("versions[%d].PR = %s, want sentinel %s (order not preserved)", n, sentinel.PR, sentinelPR)
+	sentinel := versions[n-1]
+	if sentinel.PR != strconv.Itoa(cursorPR) {
+		t.Fatalf("versions[%d].PR = %s, want cursorPR %d to carry the table as the last entry", n-1, sentinel.PR, cursorPR)
 	}
 	for i := range n {
 		number := i + 1
