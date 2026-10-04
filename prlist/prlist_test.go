@@ -3,6 +3,7 @@ package prlist
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -522,6 +523,74 @@ func TestApplyCommentTriggers_PlainNewCommit_NeverTouchedByBookkeeping(t *testin
 	}
 	if v.CommentWatermarks != nil {
 		t.Errorf("CommentWatermarks = %v, want nil — a plain new commit must never carry the shared table, or it risks being buried by a later, unrelated bookkeeping update", v.CommentWatermarks)
+	}
+}
+
+// TestApplyCommentTriggers_UnrecoverableTable_FallsBackToSentinel_NeverPiggybacks
+// is a regression test for the exact bug confirmed live immediately after
+// the previous fix: once a plain new commit becomes the resource's
+// "latest" version (carrying no CommentWatermarks, as it should), the very
+// next check has tracked == nil even though nothing about ANY PR's own
+// comments has changed. An earlier version of this function treated every
+// key absent from a nil/empty tracked map as "a brand-new PR, safe to
+// piggyback the table on" — but tracked being empty here doesn't mean any
+// PR is actually new; it only means the table wasn't recoverable from
+// whatever became "latest" last time. That version incorrectly attached
+// the table to an arbitrary, completely stable, already-built PR's
+// version, spuriously rebuilding it. Neither PR here has a new comment, so
+// neither of their entries may be touched; the table must only be
+// recorded via a standalone bookkeeping version instead.
+func TestApplyCommentTriggers_UnrecoverableTable_FallsBackToSentinel_NeverPiggybacks(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/39/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 100, "body": "concourse plan"}]`)
+	})
+	mux.HandleFunc("/repos/owner/repo/issues/41/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 200, "body": "concourse plan"}]`)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr39 := &models.PullRequest{Number: 39, HeadRefOID: "sha-39", CommittedDate: "2026-10-03T14:48:11Z"}
+	pr41 := &models.PullRequest{Number: 41, HeadRefOID: "sha-41", CommittedDate: "2026-10-04T10:17:25Z"}
+	baseVersions := []models.Version{
+		{PR: "39", Commit: "sha-39", CommittedDate: "2026-10-03T14:48:11Z"},
+		{PR: "41", Commit: "sha-41", CommittedDate: "2026-10-04T10:17:25Z"},
+	}
+
+	// request.Version is a plain commit-based entry (PR 41's own, from the
+	// immediately preceding check) — it carries no CommentWatermarks at
+	// all, exactly as a plain new commit should. Both PRs' comment ids
+	// (100, 200) are already fully up to date; nothing has changed.
+	request := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: &models.Version{PR: "41", Commit: "sha-41", CommentID: 200, CommentBaseline: true},
+	}
+
+	versions, err := applyCommentTriggers(
+		context.Background(), request, gc, []*models.PullRequest{pr39, pr41}, baseVersions, DefaultCheckConcurrency,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, v := range versions {
+		if (v.PR == "39" || v.PR == "41") && v.CommentWatermarks != nil {
+			t.Errorf("PR #%s was perturbed by the unrecoverable table — got CommentWatermarks %v, want nil: %+v", v.PR, v.CommentWatermarks, v)
+		}
+	}
+
+	var sentinel *models.Version
+	for i := range versions {
+		if versions[i].PR == sentinelPR {
+			sentinel = &versions[i]
+		}
+	}
+	if sentinel == nil {
+		t.Fatalf("expected a standalone bookkeeping version to carry the table, got %+v", versions)
+	}
+	want := map[string]int64{"39": 100, "41": 200}
+	if !maps.Equal(sentinel.CommentWatermarks, want) {
+		t.Errorf("bookkeeping CommentWatermarks = %v, want %v", sentinel.CommentWatermarks, want)
 	}
 }
 
@@ -1236,5 +1305,275 @@ func TestCheck_CommentTrigger_NonSentinelLastVersion_ReEstablishesBaseline(t *te
 		if v.PR == strconv.Itoa(prA) && v.CommentID == newCommentID {
 			t.Fatalf("PR #%d's comment trigger fired even though the cursor was on a different PR — no shared table should exist to make this possible: %+v", prA, versions)
 		}
+	}
+}
+
+// TestCheck_MultipleCommitsAndNewPROpenedInSameCheck is an end-to-end
+// regression test combining every scenario this feature has broken in
+// some earlier form, all in a single check — the realistic situation
+// where several things happen within one ~1-minute check interval:
+//   - PR #10 and PR #20 (both already tracked) each get a genuine new
+//     commit, with no comment activity involved.
+//   - PR #30 opens for the first time in this very check, with no
+//     comment activity either.
+//
+// None of these three events has anything to do with comments, so none
+// of their versions may carry CommentWatermarks or otherwise differ from
+// what a plain commit-based check would produce. The watermark table did
+// change (PR #30 is now tracked), so it must still be recorded somewhere
+// — via a standalone bookkeeping version, never by perturbing any of the
+// three real entries above.
+func TestCheck_MultipleCommitsAndNewPROpenedInSameCheck(t *testing.T) {
+	type prFixture struct {
+		number        int
+		headSHA       string
+		committedDate string
+		commentID     int64 // highest matching comment currently on this PR
+	}
+	prs := []prFixture{
+		{number: 10, headSHA: "new-sha-10", committedDate: "2026-10-04T10:00:00Z", commentID: 100},
+		{number: 20, headSHA: "new-sha-20", committedDate: "2026-10-04T10:05:00Z", commentID: 200},
+		{number: 30, headSHA: "sha-30", committedDate: "2026-10-04T10:10:00Z", commentID: 0}, // brand new, no comments at all yet
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var edges []string
+		for _, pr := range prs {
+			edges = append(edges, fmt.Sprintf(`{"node":{
+				"number": %d, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+				"baseRefName": "main", "headRefName": "f", "headRefOid": %q,
+				"repository": {"url": "u"}, "headRepository": {"url": "u"},
+				"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+				"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": %q, "additions": 1, "deletions": 0}}]},
+				"reviews": {"nodes": []}
+			}}`, pr.number, pr.headSHA, pr.headSHA, pr.committedDate))
+		}
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`,
+			strings.Join(edges, ","))
+	})
+	for _, pr := range prs {
+		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
+			if pr.commentID == 0 {
+				_, _ = fmt.Fprint(w, `[]`)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}]`, pr.commentID)
+		})
+	}
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository:      "owner/repo",
+			TriggerComments: []string{"concourse plan"},
+			// No Paths configured: every PR matches unconditionally, so
+			// this test exercises the commit/comment interaction alone.
+		},
+	}
+
+	// PR #10 and #20 were already tracked (old commits, baselines
+	// established); PR #30 isn't in the table at all yet.
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: map[string]int64{"10": 100, "20": 200},
+		},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	byPR := make(map[string]models.Version, len(versions))
+	for _, v := range versions {
+		byPR[v.PR] = v
+	}
+
+	wantCommits := map[string]string{"10": "new-sha-10", "20": "new-sha-20", "30": "sha-30"}
+	for prKey, wantCommit := range wantCommits {
+		v, ok := byPR[prKey]
+		if !ok {
+			t.Fatalf("no version found for PR #%s: %+v", prKey, versions)
+		}
+		if v.Commit != wantCommit {
+			t.Errorf("PR #%s: Commit = %s, want %s", prKey, v.Commit, wantCommit)
+		}
+		if v.CommentWatermarks != nil {
+			t.Errorf("PR #%s was perturbed by the comment-trigger table — got CommentWatermarks %v, want nil: %+v", prKey, v.CommentWatermarks, v)
+		}
+	}
+
+	sentinel, ok := byPR[sentinelPR]
+	if !ok {
+		t.Fatalf("expected a standalone bookkeeping version recording PR #30 joining the tracked table, got %+v", versions)
+	}
+	want := map[string]int64{"10": 100, "20": 200, "30": 0}
+	if !maps.Equal(sentinel.CommentWatermarks, want) {
+		t.Errorf("bookkeeping CommentWatermarks = %v, want %v", sentinel.CommentWatermarks, want)
+	}
+
+	if len(versions) != 4 {
+		t.Fatalf("got %d versions, want exactly 4 (3 real PRs + 1 bookkeeping): %+v", len(versions), versions)
+	}
+}
+
+// TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck extends the
+// scenario above with the remaining realistic case: two ALREADY-tracked
+// PRs also get a genuine new "concourse plan" comment in the very same
+// check, alongside two other PRs getting a plain new commit and a brand
+// new PR opening — everything that can happen within one ~1-minute check
+// interval, happening at once.
+//
+//   - PR #10, #20: new commit, no comment activity (same as above).
+//   - PR #30: opens for the first time, no comment activity (same as above).
+//   - PR #40, #50: NO new commit, but each gets a genuine new matching
+//     comment — both must fire; neither may be silently dropped in favor
+//     of the other (the exact bug a shared, single-cursor table caused).
+//
+// Since #40/#50 triggering already provides an independently-new entry to
+// carry the table, PR #30 joining the tracked set rides along for free —
+// no separate bookkeeping version should be needed at all this time.
+func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
+	type prFixture struct {
+		number        int
+		headSHA       string
+		committedDate string
+		oldCommentID  int64 // 0 means "not yet tracked"
+		newCommentID  int64 // 0 means "no new comment this check"
+	}
+	prs := []prFixture{
+		{number: 10, headSHA: "new-sha-10", committedDate: "2026-10-04T10:00:00Z", oldCommentID: 100, newCommentID: 100},
+		{number: 20, headSHA: "new-sha-20", committedDate: "2026-10-04T10:05:00Z", oldCommentID: 200, newCommentID: 200},
+		{number: 30, headSHA: "sha-30", committedDate: "2026-10-04T10:10:00Z", oldCommentID: 0, newCommentID: 0},
+		{number: 40, headSHA: "sha-40", committedDate: "2026-09-01T00:00:00Z", oldCommentID: 400, newCommentID: 401},
+		{number: 50, headSHA: "sha-50", committedDate: "2026-09-02T00:00:00Z", oldCommentID: 500, newCommentID: 501},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var edges []string
+		for _, pr := range prs {
+			edges = append(edges, fmt.Sprintf(`{"node":{
+				"number": %d, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+				"baseRefName": "main", "headRefName": "f", "headRefOid": %q,
+				"repository": {"url": "u"}, "headRepository": {"url": "u"},
+				"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+				"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": %q, "additions": 1, "deletions": 0}}]},
+				"reviews": {"nodes": []}
+			}}`, pr.number, pr.headSHA, pr.headSHA, pr.committedDate))
+		}
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`,
+			strings.Join(edges, ","))
+	})
+	for _, pr := range prs {
+		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
+			if pr.newCommentID == 0 {
+				_, _ = fmt.Fprint(w, `[]`)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}]`, pr.newCommentID)
+		})
+	}
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository:      "owner/repo",
+			TriggerComments: []string{"concourse plan"},
+		},
+	}
+
+	tracked := map[string]int64{}
+	for _, pr := range prs {
+		if pr.oldCommentID != 0 {
+			tracked[strconv.Itoa(pr.number)] = pr.oldCommentID
+		}
+	}
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: tracked,
+		},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	byPR := make(map[string]models.Version, len(versions))
+	for _, v := range versions {
+		byPR[v.PR] = v
+	}
+
+	// No separate bookkeeping version: #40/#50 triggering already
+	// provides a carrier, so PR #30 joining the table rides along for free.
+	if _, ok := byPR[sentinelPR]; ok {
+		t.Errorf("unexpected standalone bookkeeping version — a trigger already provides a carrier this cycle: %+v", versions)
+	}
+	if len(versions) != len(prs) {
+		t.Fatalf("got %d versions, want exactly %d (one per real PR, no extras): %+v", len(versions), len(prs), versions)
+	}
+
+	wantTable := map[string]int64{"10": 100, "20": 200, "30": 0, "40": 401, "50": 501}
+	var carrierPR string
+	for _, pr := range prs {
+		prKey := strconv.Itoa(pr.number)
+		v, ok := byPR[prKey]
+		if !ok {
+			t.Fatalf("no version found for PR #%d: %+v", pr.number, versions)
+		}
+		if v.Commit != pr.headSHA {
+			t.Errorf("PR #%d: Commit = %s, want %s", pr.number, v.Commit, pr.headSHA)
+		}
+		// Every PR's own entry always carries its own current comment
+		// state, deterministically, once trigger_comments is configured —
+		// triggered or not (see TestApplyCommentTriggers_ManyPRsConcurrently).
+		// For #10/#20/#30 that's their unchanged (or, for #30, baseline)
+		// id; "perturbed" here specifically means picking up something
+		// that isn't its own — e.g. the shared table, checked separately
+		// below.
+		if v.CommentID != pr.newCommentID {
+			t.Errorf("PR #%d: CommentID = %d, want %d", pr.number, v.CommentID, pr.newCommentID)
+		}
+		if !v.CommentBaseline {
+			t.Errorf("PR #%d: CommentBaseline = false, want true", pr.number)
+		}
+		if v.CommentWatermarks != nil {
+			if carrierPR != "" {
+				t.Fatalf("more than one version carries CommentWatermarks — PR #%s and PR #%d: %+v", carrierPR, pr.number, versions)
+			}
+			carrierPR = prKey
+			if !maps.Equal(v.CommentWatermarks, wantTable) {
+				t.Errorf("PR #%d (carrier) CommentWatermarks = %v, want %v", pr.number, v.CommentWatermarks, wantTable)
+			}
+		}
+	}
+	if carrierPR == "" {
+		t.Error("expected exactly one triggered PR's version to carry the full watermark table, found none")
 	}
 }
