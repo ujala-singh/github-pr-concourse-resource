@@ -15,6 +15,10 @@ import (
 // In performs the in operation for PR list mode
 // Clones the repository and checks out the PR commit
 func In(request InRequest, github *models.GithubClient, destinationDir string) (InResponse, error) {
+	if request.Version.PR == sentinelPR {
+		return inBookkeeping(request, destinationDir)
+	}
+
 	ctx := context.Background()
 
 	// Handle skip_download parameter
@@ -109,6 +113,50 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 	// Write metadata to files in destination directory
 	if err := writeMetadataFiles(destinationDir, metadata, request.Version); err != nil {
 		return InResponse{}, fmt.Errorf("failed to write metadata: %w", err)
+	}
+
+	return InResponse{
+		Version:  request.Version,
+		Metadata: metadata,
+	}, nil
+}
+
+// BookkeepingMarkerFile is written at the root of the destination directory
+// in place of a checked-out repository when In receives the dedicated
+// comment-trigger bookkeeping version (see applyCommentTriggers'
+// sentinelPR). A downstream pipeline task should check for this file and
+// exit immediately without doing any real plan/apply work — this version
+// corresponds to no real PR; it exists purely to carry the comment-trigger
+// watermark table across checks.
+const BookkeepingMarkerFile = "COMMENT_TRIGGER_BOOKKEEPING"
+
+// inBookkeeping handles the dedicated comment-trigger bookkeeping version:
+// there's no real PR to look up or repository to clone, so it just writes
+// BookkeepingMarkerFile and minimal metadata instead.
+func inBookkeeping(request InRequest, destinationDir string) (InResponse, error) {
+	if err := os.MkdirAll(destinationDir, 0755); err != nil {
+		return InResponse{}, fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	marker := filepath.Join(destinationDir, BookkeepingMarkerFile)
+	body := "This version carries no real PR — it exists only to carry the " +
+		"comment-trigger watermark table across checks. See " +
+		"prlist.applyCommentTriggers. Downstream pipeline tasks should " +
+		"check for this file and skip real work.\n"
+	if err := os.WriteFile(marker, []byte(body), 0644); err != nil {
+		return InResponse{}, fmt.Errorf("failed to write %s: %w", BookkeepingMarkerFile, err)
+	}
+
+	// No repository was cloned, so metadata is written flat at the
+	// destination root rather than via writeMetadataFiles (which assumes a
+	// checked-out .git directory exists to nest a resource/ folder under).
+	metadata := []models.Metadata{
+		{Name: "pr", Value: request.Version.PR},
+	}
+	for _, m := range metadata {
+		if err := os.WriteFile(filepath.Join(destinationDir, m.Name), []byte(m.Value), 0644); err != nil {
+			return InResponse{}, fmt.Errorf("failed to write %s: %w", m.Name, err)
+		}
 	}
 
 	return InResponse{
