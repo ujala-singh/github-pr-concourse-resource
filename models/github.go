@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -144,15 +145,29 @@ func (gc *GithubClient) GetPullRequests(ctx context.Context) ([]*PullRequest, er
 	return allPRs, nil
 }
 
+// prNumberVar converts a PR number to the GraphQL Int (32-bit) type,
+// rejecting values a PR number can't have instead of letting them wrap.
+func prNumberVar(number int) (githubv4.Int, error) {
+	if number < 1 || number > math.MaxInt32 {
+		return 0, fmt.Errorf("invalid pull request number %d", number)
+	}
+	return githubv4.Int(number), nil
+}
+
 // GetPullRequest fetches a single pull request by number
 func (gc *GithubClient) GetPullRequest(ctx context.Context, number int) (*PullRequest, error) {
 	owner, repo := gc.Config.GetOwnerAndRepo()
+
+	prNumber, err := prNumberVar(number)
+	if err != nil {
+		return nil, err
+	}
 
 	var query singlePRQuery
 	variables := map[string]interface{}{
 		"owner":  githubv4.String(owner),
 		"name":   githubv4.String(repo),
-		"number": githubv4.Int(number),
+		"number": prNumber,
 	}
 
 	if err := gc.V4.Query(ctx, &query, variables); err != nil {
@@ -304,6 +319,11 @@ func (gc *GithubClient) AddComment(ctx context.Context, number int, body string)
 func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int) error {
 	owner, repo := gc.Config.GetOwnerAndRepo()
 
+	prNumberArg, err := prNumberVar(prNumber)
+	if err != nil {
+		return err
+	}
+
 	// Get the current authenticated user
 	var viewerQuery struct {
 		Viewer struct {
@@ -338,7 +358,7 @@ func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int
 	variables := map[string]interface{}{
 		"repositoryOwner": githubv4.String(owner),
 		"repositoryName":  githubv4.String(repo),
-		"prNumber":        githubv4.Int(prNumber),
+		"prNumber":        prNumberArg,
 		"commentsLast":    githubv4.Int(100),
 	}
 
