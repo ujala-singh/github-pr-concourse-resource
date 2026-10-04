@@ -400,12 +400,69 @@ func TestApplyCommentTriggers_FirstObservation_EstablishesBaselineWithoutFiring(
 		}
 	}
 	// The bookkeeping version is still appended, establishing PR #42's
-	// baseline for a future check to compare against.
+	// baseline for a future check to compare against. This is safe here
+	// specifically because the base versions argument passed in is nil —
+	// PR #42 isn't present in the base snapshot (e.g. it doesn't currently
+	// path-match), so there's no real entry for the sentinel to be
+	// appended after; see TestApplyCommentTriggers_ColdStart_NeverAppendsSentinelAfterARealPR
+	// for the case where one IS present on a cold start.
 	if len(versions) != 1 || versions[0].PR != sentinelPR {
 		t.Fatalf("expected exactly the bookkeeping version, got %+v", versions)
 	}
 	if versions[0].CommentWatermarks["42"] != 555 {
 		t.Errorf("bookkeeping CommentWatermarks[\"42\"] = %d, want 555 (establishing baseline)", versions[0].CommentWatermarks["42"])
+	}
+}
+
+// TestApplyCommentTriggers_ColdStart_NeverAppendsSentinelAfterARealPR is a
+// regression test for the exact bug confirmed live: a resource with zero
+// prior PR history (request.Version == nil — this is its very first-ever
+// check) that discovers a brand-new PR with no comment activity involved.
+//
+// Confirmed directly against a running Concourse instance: on a resource's
+// first-ever check, Concourse starts from whatever the check returns as
+// its LAST array element, even with version: every configured — the same
+// deliberate design that stops a freshly added git-resource with 1000
+// historical commits from queuing 1000 builds. Appending the standalone
+// bookkeeping version after PR #8's own first-ever entry made Concourse
+// treat PR #8 as pre-existing history to skip, not build: its version was
+// correctly recorded, but `in` was never run for it (confirmed via the
+// live resource-versions API — it had no in-time metadata at all), while
+// the bookkeeping version — now "latest" — got built instead.
+func TestApplyCommentTriggers_ColdStart_NeverAppendsSentinelAfterARealPR(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/8/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[]`) // brand new PR, no comments at all yet
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr8 := &models.PullRequest{Number: 8, HeadRefOID: "a6e76106", CommittedDate: "2026-10-04T10:48:34Z"}
+	// PR #8 already matched path filters and is present in the base
+	// snapshot — exactly what Check's commit-based loop produces for a
+	// brand-new, path-matching PR appearing for the first time.
+	baseVersions := []models.Version{
+		{PR: "8", Commit: "a6e76106", CommittedDate: "2026-10-04T10:48:34Z"},
+	}
+
+	request := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: nil, // this resource has never returned anything before
+	}
+
+	versions, err := applyCommentTriggers(
+		context.Background(), request, gc, []*models.PullRequest{pr8}, baseVersions, DefaultCheckConcurrency,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, v := range versions {
+		if v.PR == sentinelPR {
+			t.Fatalf("a standalone bookkeeping version was appended after PR #8's own first-ever entry on a cold start — Concourse would treat PR #8 as pre-existing history and never build it: %+v", versions)
+		}
+	}
+	if len(versions) != 1 || versions[0].PR != "8" || versions[0].Commit != "a6e76106" {
+		t.Fatalf("expected exactly PR #8's own entry, nothing else, got %+v", versions)
 	}
 }
 
