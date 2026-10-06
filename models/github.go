@@ -86,14 +86,20 @@ func (gc *GithubClient) GetPullRequests(ctx context.Context) ([]*PullRequest, er
 	var allPRs []*PullRequest
 	var cursor *githubv4.String
 
-	// Determine which states to query
+	// Determine which states to query. DRAFT isn't a real value GitHub's
+	// states: argument accepts (see shouldSkipPR) — it maps to OPEN here,
+	// since every draft is an open PR under the hood.
 	states := []githubv4.PullRequestState{githubv4.PullRequestStateOpen}
 	if len(gc.Config.States) > 0 {
 		states = []githubv4.PullRequestState{}
+		haveOpen := false
 		for _, s := range gc.Config.States {
 			switch strings.ToUpper(s) {
-			case "OPEN":
-				states = append(states, githubv4.PullRequestStateOpen)
+			case "OPEN", "DRAFT":
+				if !haveOpen {
+					states = append(states, githubv4.PullRequestStateOpen)
+					haveOpen = true
+				}
 			case "MERGED":
 				states = append(states, githubv4.PullRequestStateMerged)
 			case "CLOSED":
@@ -467,9 +473,37 @@ func (gc *GithubClient) convertPRNode(node prNode) *PullRequest {
 	return pr
 }
 
+// draftOnlyRequested reports whether source.states asks for DRAFT PRs
+// without also asking for OPEN ones — i.e. the caller wants ONLY drafts,
+// not every open PR. An unset/empty states list means the OPEN default,
+// which already includes drafts, so this is always false in that case.
+func draftOnlyRequested(states []string) bool {
+	haveDraft, haveOpen := false, false
+	for _, s := range states {
+		switch strings.ToUpper(s) {
+		case "DRAFT":
+			haveDraft = true
+		case "OPEN":
+			haveOpen = true
+		}
+	}
+	return haveDraft && !haveOpen
+}
+
 func (gc *GithubClient) shouldSkipPR(pr *PullRequest) bool {
 	// Skip drafts if configured
 	if gc.Config.IgnoreDrafts && pr.IsDraft {
+		return true
+	}
+
+	// DRAFT is a pseudo-state (see GetPullRequests): when it's requested
+	// without OPEN also being requested, the caller wants ONLY drafts, not
+	// every open PR — so a non-draft OPEN PR, fetched only because
+	// querying DRAFT means querying OPEN under the hood, gets filtered
+	// back out here. When states is unset or includes OPEN, this never
+	// applies — OPEN's existing, long-standing default already includes
+	// drafts (unless ignore_drafts excludes them above).
+	if pr.State == "OPEN" && !pr.IsDraft && draftOnlyRequested(gc.Config.States) {
 		return true
 	}
 
