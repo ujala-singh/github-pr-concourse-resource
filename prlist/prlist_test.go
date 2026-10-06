@@ -1614,6 +1614,81 @@ func TestCheck_MultipleCommitsAndNewPROpenedInSameCheck(t *testing.T) {
 	}
 }
 
+// TestCheck_MostRecentPushLandsLast_RegardlessOfPRCreationOrder is a
+// regression test for a live bug found on PR #42/#43 of concourse-ci-poc
+// on 2026-10-07: GitHub's GraphQL pullRequests connection defaults to
+// CREATED_AT ascending with no orderBy override, so GetPullRequests' —
+// and therefore Check's — output was ordered by PR creation date, not by
+// recency of change. Concourse assigns check_order to a check's returned
+// array strictly by array position (confirmed live), so whichever PR
+// happened to be opened most recently always landed last and
+// permanently "won" the current slot — even after a genuinely new commit
+// landed on a DIFFERENT, earlier-created PR, and even across repeated
+// forced re-checks. PR #43 (opened after #42) kept outranking PR #42's
+// real new commit this way.
+//
+// This test reproduces the exact shape: PR #42 (created first, lower
+// number) gets a brand-new commit; PR #43 (created after #42, higher
+// number) has nothing new at all. The GraphQL mock returns them in
+// GitHub's real default order — #42 then #43 — and the fix
+// (sortVersionsByRecency) must still place PR #42's entry last, since
+// its commit is the one that's actually newer.
+func TestCheck_MostRecentPushLandsLast_RegardlessOfPRCreationOrder(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		// GitHub's real default order: PR #42 (created first) before PR
+		// #43 (created later) — regardless of which one actually has the
+		// newer commit.
+		edges := `{"node":{
+			"number": 42, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+			"baseRefName": "main", "headRefName": "f", "headRefOid": "sha42-new",
+			"repository": {"url": "u"}, "headRepository": {"url": "u"},
+			"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+			"commits": {"nodes": [{"commit": {"oid": "sha42-new", "committedDate": "2026-10-06T19:32:42Z", "additions": 1, "deletions": 0}}]},
+			"reviews": {"nodes": []}
+		}},{"node":{
+			"number": 43, "title": "t", "url": "u", "state": "OPEN", "isDraft": true,
+			"baseRefName": "main", "headRefName": "f", "headRefOid": "sha43-unchanged",
+			"repository": {"url": "u"}, "headRepository": {"url": "u"},
+			"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+			"commits": {"nodes": [{"commit": {"oid": "sha43-unchanged", "committedDate": "2026-10-06T18:18:30Z", "additions": 1, "deletions": 0}}]},
+			"reviews": {"nodes": []}
+		}}`
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`, edges)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository: "owner/repo",
+			// No Paths configured: every PR matches unconditionally, so
+			// this isolates the pure ordering question from path
+			// filtering.
+		},
+	}
+
+	versions, err := Check(CheckRequest{Source: Source{CommonConfig: gc.Config}}, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(versions) != 2 {
+		t.Fatalf("got %d versions, want 2: %+v", len(versions), versions)
+	}
+	if last := versions[len(versions)-1]; last.PR != "42" {
+		t.Fatalf(`last version = PR #%s, want PR #42 (its commit is the actually newer one) — Concourse treats whatever's last as "current": %+v`, last.PR, versions)
+	}
+}
+
 // TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck extends the
 // scenario above with the remaining realistic case: two ALREADY-tracked
 // PRs also get a genuine new "concourse plan" comment in the very same

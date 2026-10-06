@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -39,6 +40,24 @@ func resolveCheckConcurrency(source Source) int {
 	return DefaultCheckConcurrency
 }
 
+// sortVersionsByRecency orders versions by CommittedDate ascending (RFC3339
+// timestamps sort correctly as plain strings), breaking ties by PR number
+// ascending for determinism. See Check's doc comment on why this matters:
+// Concourse assigns check_order by array position, so whichever entry ends
+// up last here is the one that wins the "current" slot — this makes that
+// the PR with the most recently pushed commit, not just whichever PR
+// happens to have the highest/newest PR number.
+func sortVersionsByRecency(versions []models.Version) {
+	sort.SliceStable(versions, func(i, j int) bool {
+		if versions[i].CommittedDate != versions[j].CommittedDate {
+			return versions[i].CommittedDate < versions[j].CommittedDate
+		}
+		iNum, _ := strconv.Atoi(versions[i].PR)
+		jNum, _ := strconv.Atoi(versions[j].PR)
+		return iNum < jNum
+	})
+}
+
 // Check performs the check operation for PR list mode
 // Returns a list of versions representing the current set of PRs
 func Check(request CheckRequest, github *models.GithubClient) ([]models.Version, error) {
@@ -63,12 +82,30 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	// matched purely on PR NUMBER, so once a PR had been seen once, any
 	// later commit pushed to that SAME PR was silently dropped forever —
 	// its entry was always found at "the cursor" and skipped, no matter
-	// how much its Commit/CommittedDate had changed since. Concourse's ATC
-	// already dedups by exact version equality against its own recorded
-	// history, so returning the full snapshot is both simpler and
-	// correct: an unchanged PR's version is a no-op, while a PR with a new
-	// commit (or a brand-new PR) is picked up as new regardless of its
+	// how much its Commit/CommittedDate had changed since. Returning the
+	// full snapshot every check is both simpler and correct in terms of
+	// WHAT it returns — an unchanged PR's version is a no-op, a PR with a
+	// new commit (or a brand-new PR) is a new row regardless of its
 	// position in the list.
+	//
+	// Position still matters, though — confirmed live, Concourse assigns
+	// check_order to a check's returned array strictly by array position,
+	// for every version it mentions, new row or not: whichever entry
+	// lands last gets bumped to be the newest-ranked, even if it's an
+	// unchanged row just reappearing, and even ahead of a different,
+	// brand-new row that appeared earlier in the very same array. GitHub
+	// GraphQL's pullRequests connection defaults to CREATED_AT ascending
+	// with no orderBy override, so filteredPRs — and this loop's output —
+	// is ordered by PR creation date, NOT by recency of change. Left
+	// alone, that means whichever open, path-matching PR happens to have
+	// been opened most recently always lands last and perpetually "wins"
+	// the current slot, starving every other PR's genuinely new commits
+	// from ever being recognized — confirmed live on concourse-ci-poc: PR
+	// #43 (opened after #42) kept outranking PR #42's actual new commit
+	// even across repeated forced re-checks. Sorting by CommittedDate
+	// instead aligns the array's order with actual code recency, so the
+	// PR that most recently pushed lands last and wins, regardless of
+	// which PR happens to have the newer number.
 	var versions []models.Version
 	for _, pr := range filteredPRs {
 		versions = append(versions, models.Version{
@@ -78,6 +115,7 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 			ApprovedReviewCount: pr.ApprovedReviewCount,
 		})
 	}
+	sortVersionsByRecency(versions)
 
 	// If nothing currently matches (e.g. no open PRs touch the configured
 	// paths), echo back the last known version so the resource doesn't
@@ -315,6 +353,27 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			CommentBaseline:     true,
 		})
 	}
+
+	// Move any PR that genuinely triggered this cycle after every PR that
+	// didn't, preserving each group's relative order. A comment trigger
+	// doesn't bump CommittedDate — the underlying commit didn't change —
+	// so Check's recency sort (sortVersionsByRecency) wouldn't otherwise
+	// place a triggered PR last, and Concourse decides what's "current"
+	// purely by final array position (see that function's doc comment).
+	// A freshly appended triggered PR (the loop just above) is already at
+	// the tail, so this is a no-op for it; this only actually moves a
+	// triggered PR that was already present at some earlier, date-sorted
+	// position.
+	stable := make([]models.Version, 0, len(versions))
+	var triggeredEntries []models.Version
+	for _, v := range versions {
+		if r, ok := byPR[v.PR]; ok && r.triggered {
+			triggeredEntries = append(triggeredEntries, v)
+			continue
+		}
+		stable = append(stable, v)
+	}
+	versions = append(stable, triggeredEntries...)
 
 	// newTable (this cycle's complete, freshly pruned-to-currently-open-PRs
 	// table) only needs to be recorded somewhere when it actually changed.
