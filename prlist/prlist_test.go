@@ -1838,22 +1838,24 @@ func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
 	}
 }
 
-// TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently
+// TestCheck_ManySimultaneousCommitsCommentsMergesAndNewPRs_AllFireIndependently
 // is a larger-scale regression test combining everything that can happen
 // within one ~1-minute check window: 5 PRs each get a genuine new commit,
 // 3 different PRs each get a genuine new matching comment (no commit
-// change), and 2 previously-tracked PRs are merged/closed (so GitHub
-// simply stops returning them as OPEN this check). All ten events are
+// change), 2 previously-tracked PRs are merged/closed (so GitHub simply
+// stops returning them as OPEN this check), and 3 more PRs open for the
+// very first time (no prior baseline at all). All thirteen events are
 // independent of each other.
 //
-// Every one of the 8 real PRs must end up with its own correct version —
+// Every one of the 11 real PRs must end up with its own correct version —
 // none silently dropped, none perturbed by another PR's event — and the
-// 3 comment-triggered PRs must land after all 5 commit PRs in the
-// returned array, since a comment doesn't bump CommittedDate and
-// wouldn't otherwise sort last (see sortVersionsByRecency and the
-// trigger-partition in applyCommentTriggers). The 2 merges must simply
-// drop out of the tracked table without otherwise disturbing anything.
-func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *testing.T) {
+// 3 comment-triggered PRs must land after every commit-only and
+// brand-new PR in the returned array, since a comment doesn't bump
+// CommittedDate and wouldn't otherwise sort last (see
+// sortVersionsByRecency and the trigger-partition in
+// applyCommentTriggers). The 2 merges must simply drop out of the
+// tracked table without otherwise disturbing anything.
+func TestCheck_ManySimultaneousCommitsCommentsMergesAndNewPRs_AllFireIndependently(t *testing.T) {
 	type commitFixture struct {
 		number        int
 		headSHA       string
@@ -1884,6 +1886,14 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 	// PRs #9-10 were previously tracked but are merged/closed as of this
 	// check — GitHub simply stops returning them as OPEN at all.
 
+	// PRs #11-13 open for the very first time this check — no prior
+	// baseline, no comment activity, just a brand-new PR appearing.
+	newPRs := []commitFixture{
+		{number: 11, headSHA: "sha-11-first", committedDate: "2026-10-07T10:00:11Z"},
+		{number: 12, headSHA: "sha-12-first", committedDate: "2026-10-07T10:00:12Z"},
+		{number: 13, headSHA: "sha-13-first", committedDate: "2026-10-07T10:00:13Z"},
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		var edges []string
@@ -1907,6 +1917,16 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 				"reviews": {"nodes": []}
 			}}`, pr.number, pr.headSHA, pr.headSHA, pr.committedDate))
 		}
+		for _, pr := range newPRs {
+			edges = append(edges, fmt.Sprintf(`{"node":{
+				"number": %d, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+				"baseRefName": "main", "headRefName": "f", "headRefOid": %q,
+				"repository": {"url": "u"}, "headRepository": {"url": "u"},
+				"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+				"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": %q, "additions": 1, "deletions": 0}}]},
+				"reviews": {"nodes": []}
+			}}`, pr.number, pr.headSHA, pr.headSHA, pr.committedDate))
+		}
 		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`,
 			strings.Join(edges, ","))
 	})
@@ -1918,6 +1938,11 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 	for _, pr := range commentPRs {
 		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
 			_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, pr.oldCommentID, pr.newCommentID)
+		})
+	}
+	for _, pr := range newPRs {
+		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprint(w, `[]`)
 		})
 	}
 	server := httptest.NewServer(mux)
@@ -1957,8 +1982,8 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(versions) != 9 { // 5 commit PRs + 3 comment PRs + 1 bookkeeping
-		t.Fatalf("got %d versions, want exactly 9: %+v", len(versions), versions)
+	if len(versions) != 12 { // 5 commit + 3 comment + 3 new PRs + 1 bookkeeping
+		t.Fatalf("got %d versions, want exactly 12: %+v", len(versions), versions)
 	}
 
 	indexOf := make(map[string]int, len(versions))
@@ -1975,6 +2000,22 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 		v, ok := byPR[prKey]
 		if !ok {
 			t.Fatalf("no version found for commit PR #%d: %+v", pr.number, versions)
+		}
+		if v.Commit != pr.headSHA {
+			t.Errorf("PR #%d: Commit = %s, want %s", pr.number, v.Commit, pr.headSHA)
+		}
+		if v.CommentWatermarks != nil {
+			t.Errorf("PR #%d: CommentWatermarks = %v, want nil", pr.number, v.CommentWatermarks)
+		}
+	}
+
+	// All 3 brand-new PRs appeared with their own first-ever version, no
+	// baseline required, untouched by anything else.
+	for _, pr := range newPRs {
+		prKey := strconv.Itoa(pr.number)
+		v, ok := byPR[prKey]
+		if !ok {
+			t.Fatalf("no version found for new PR #%d: %+v", pr.number, versions)
 		}
 		if v.Commit != pr.headSHA {
 			t.Errorf("PR #%d: Commit = %s, want %s", pr.number, v.Commit, pr.headSHA)
@@ -2003,18 +2044,19 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 	}
 
 	// Every comment-triggered PR must be positioned after every
-	// commit-only PR, since Concourse decides what's "current" purely by
-	// final array position and a comment doesn't bump CommittedDate.
-	maxCommitIndex := -1
-	for _, pr := range commitPRs {
-		if idx := indexOf[strconv.Itoa(pr.number)]; idx > maxCommitIndex {
-			maxCommitIndex = idx
+	// commit-only and brand-new PR, since Concourse decides what's
+	// "current" purely by final array position and a comment doesn't
+	// bump CommittedDate.
+	maxNonCommentIndex := -1
+	for _, pr := range append(append([]commitFixture{}, commitPRs...), newPRs...) {
+		if idx := indexOf[strconv.Itoa(pr.number)]; idx > maxNonCommentIndex {
+			maxNonCommentIndex = idx
 		}
 	}
 	for _, pr := range commentPRs {
-		if idx := indexOf[strconv.Itoa(pr.number)]; idx < maxCommitIndex {
-			t.Errorf("comment-triggered PR #%d at index %d is positioned before commit PR at index %d — risks being buried",
-				pr.number, idx, maxCommitIndex)
+		if idx := indexOf[strconv.Itoa(pr.number)]; idx < maxNonCommentIndex {
+			t.Errorf("comment-triggered PR #%d at index %d is positioned before a non-comment PR at index %d — risks being buried",
+				pr.number, idx, maxNonCommentIndex)
 		}
 	}
 
@@ -2033,7 +2075,11 @@ func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *
 	if indexOf[sentinelPR] != len(versions)-1 {
 		t.Errorf("bookkeeping version is not last: index %d of %d", indexOf[sentinelPR], len(versions))
 	}
-	wantTable := map[string]int64{"1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 601, "7": 701, "8": 801}
+	wantTable := map[string]int64{
+		"1": 0, "2": 0, "3": 0, "4": 0, "5": 0,
+		"6": 601, "7": 701, "8": 801,
+		"11": 0, "12": 0, "13": 0,
+	}
 	if !maps.Equal(sentinel.CommentWatermarks, wantTable) {
 		t.Errorf("bookkeeping CommentWatermarks = %v, want %v (PRs #9/#10 must drop out)", sentinel.CommentWatermarks, wantTable)
 	}
