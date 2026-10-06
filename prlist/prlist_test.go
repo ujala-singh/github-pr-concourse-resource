@@ -671,24 +671,142 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// No separate bookkeeping version: the triggered entry is already
-	// genuinely new this cycle, so the table rides on it directly instead
-	// of a second, standalone entry — this matters because a separate
-	// trailing bookkeeping entry would bury a plain new commit landing in
-	// the same or a later check (confirmed live; see applyCommentTriggers'
-	// doc comment).
-	if len(versions) != 1 {
-		t.Fatalf("expected exactly the triggered version (table piggybacked on it), got %d: %+v", len(versions), versions)
+	// The triggered PR's own version never carries CommentWatermarks — only
+	// a standalone bookkeeping version does, even though PR #42 is already
+	// independently new this cycle. Piggybacking the table onto a real PR's
+	// entry was tried and found unsafe live: that PR's version then toggles
+	// shape (with/without CommentWatermarks) across checks depending on
+	// whether it happens to be the carrier, which Concourse treats as a
+	// genuinely new version and rebuilds — see applyCommentTriggers' doc
+	// comment (PR #43 on concourse-ci-poc).
+	if len(versions) != 2 {
+		t.Fatalf("expected the triggered PR version plus a standalone bookkeeping version, got %d: %+v", len(versions), versions)
 	}
-	triggered := versions[0]
+	var triggered, bookkeeping *models.Version
+	for i := range versions {
+		if versions[i].PR == sentinelPR {
+			bookkeeping = &versions[i]
+		} else {
+			triggered = &versions[i]
+		}
+	}
+	if triggered == nil || bookkeeping == nil {
+		t.Fatalf("expected one real-PR version and one bookkeeping version, got %+v", versions)
+	}
 	if triggered.CommentID != 555 {
 		t.Errorf("CommentID = %d, want 555", triggered.CommentID)
 	}
 	if triggered.PR != "42" || triggered.Commit != "abc123" {
 		t.Errorf("triggered version = %+v, want PR 42 at current HEAD abc123", triggered)
 	}
-	if triggered.CommentWatermarks["42"] != 555 {
-		t.Errorf("triggered version CommentWatermarks[\"42\"] = %d, want 555", triggered.CommentWatermarks["42"])
+	if triggered.CommentWatermarks != nil {
+		t.Errorf("triggered version CommentWatermarks = %v, want nil — must never carry the shared table", triggered.CommentWatermarks)
+	}
+	if bookkeeping.CommentWatermarks["42"] != 555 {
+		t.Errorf("bookkeeping CommentWatermarks[\"42\"] = %d, want 555", bookkeeping.CommentWatermarks["42"])
+	}
+}
+
+// TestApplyCommentTriggers_RealPRNeverTogglesWatermarkOwnership is a
+// regression test for the exact live bug found on PR #42/#43 of
+// concourse-ci-poc on 2026-10-07: an earlier design piggybacked the
+// shared watermark table onto whichever real PR happened to trigger that
+// cycle. PR #43 triggered on one check and carried the table; on a later
+// check PR #42 triggered instead and became the new carrier — so PR #43
+// reappeared with its IDENTICAL commit and comment id, just without
+// CommentWatermarks attached anymore. Concourse diffs the full version
+// map, so that bare presence/absence alone made an unchanged,
+// already-built PR look like a brand-new version, and it was rebuilt: a
+// real, wasted terraform plan re-run, not a cosmetic one.
+//
+// This test runs two sequential simulated checks — PR #43 fires in the
+// first, PR #42 fires in the second, nothing about PR #43 changes
+// between them — and asserts PR #43's own version is identical in both:
+// it must never carry CommentWatermarks, in either check.
+func TestApplyCommentTriggers_RealPRNeverTogglesWatermarkOwnership(t *testing.T) {
+	// comments42/comments43 are mutated between the two simulated checks
+	// below; the mux handlers themselves stay fixed and just read
+	// whatever the variables currently hold.
+	var comments42, comments43 string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, comments42)
+	})
+	mux.HandleFunc("/repos/owner/repo/issues/43/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, comments43)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr42 := &models.PullRequest{Number: 42, HeadRefOID: "sha42", CommittedDate: "2026-10-06T00:00:00Z"}
+	pr43 := &models.PullRequest{Number: 43, HeadRefOID: "sha43", CommittedDate: "2026-10-06T00:00:00Z", IsDraft: true}
+
+	// Check 1: PR #43 already has an established baseline and gets a
+	// genuine new matching comment, so it fires. PR #42's id-100 comment
+	// isn't tracked yet, so it can't fire regardless of what's on it.
+	comments42 = `[{"id": 100, "body": "concourse plan"}]`
+	comments43 = `[{"id": 555, "body": "concourse plan"}]`
+	request1 := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: &models.Version{PR: sentinelPR, CommentBaseline: true, CommentWatermarks: map[string]int64{"43": 100}},
+	}
+	baseVersions1 := []models.Version{{PR: "43", Commit: "sha43", CommittedDate: pr43.CommittedDate}}
+
+	versions1, err := applyCommentTriggers(context.Background(), request1, gc, []*models.PullRequest{pr42, pr43}, baseVersions1, DefaultCheckConcurrency)
+	if err != nil {
+		t.Fatalf("check 1: unexpected error: %v", err)
+	}
+
+	var v43Check1, sentinel1 *models.Version
+	for i := range versions1 {
+		switch versions1[i].PR {
+		case "43":
+			v43Check1 = &versions1[i]
+		case sentinelPR:
+			sentinel1 = &versions1[i]
+		}
+	}
+	if v43Check1 == nil {
+		t.Fatalf("check 1: no version found for PR #43: %+v", versions1)
+	}
+	if sentinel1 == nil {
+		t.Fatalf("check 1: expected a standalone bookkeeping version, got %+v", versions1)
+	}
+	if v43Check1.CommentWatermarks != nil {
+		t.Fatalf("check 1: PR #43's own version carries CommentWatermarks (%v) — must never happen", v43Check1.CommentWatermarks)
+	}
+
+	// Check 2: nothing about PR #43 changes — same comments, same commit.
+	// PR #42 now fires instead (its id-100 baseline was just established
+	// by check 1's table). request.Version here is whatever check 1
+	// returned as its bookkeeping version — the only thing that changed
+	// in check 1's table-tracking, and therefore what Concourse would
+	// have fed back as "latest".
+	comments42 = `[{"id": 100, "body": "concourse plan"}, {"id": 200, "body": "concourse plan"}]`
+	request2 := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: sentinel1,
+	}
+	baseVersions2 := []models.Version{*v43Check1}
+
+	versions2, err := applyCommentTriggers(context.Background(), request2, gc, []*models.PullRequest{pr42, pr43}, baseVersions2, DefaultCheckConcurrency)
+	if err != nil {
+		t.Fatalf("check 2: unexpected error: %v", err)
+	}
+
+	var v43Check2 *models.Version
+	for i := range versions2 {
+		if versions2[i].PR == "43" {
+			v43Check2 = &versions2[i]
+		}
+	}
+	if v43Check2 == nil {
+		t.Fatalf("check 2: no version found for PR #43: %+v", versions2)
+	}
+	if v43Check2.CommentWatermarks != nil {
+		t.Fatalf("check 2: PR #43's own version carries CommentWatermarks (%v) — must never happen", v43Check2.CommentWatermarks)
+	}
+	if v43Check2.CommentID != v43Check1.CommentID || v43Check2.Commit != v43Check1.Commit {
+		t.Fatalf("PR #43's version changed across checks despite nothing about PR #43 changing:\ncheck 1: %+v\ncheck 2: %+v", v43Check1, v43Check2)
 	}
 }
 
@@ -819,7 +937,9 @@ func TestApplyCommentTriggers_ClosingOnePRNeverPerturbsAnother(t *testing.T) {
 //     baseline to compare against this cycle, none of them count as firing
 //     a build. Since cursorPR is already present in the base versions (not
 //     missing due to a path mismatch), its trigger is reflected by
-//     updating its own entry in place — no extra version is appended.
+//     updating its own entry in place; the watermark table itself still
+//     goes to a separate, standalone bookkeeping version, never onto
+//     cursorPR's own entry — one extra version is appended for it.
 func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 	const n = DefaultCheckConcurrency*2 + 3 // force multiple bounded batches
 	const cursorPR = 5                      // arbitrary PR whose baseline is established
@@ -873,14 +993,14 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// No extra versions are appended at all: cursorPR was already present
-	// among the base versions, so its trigger is reflected in place, and
-	// since it's already genuinely new this cycle, the table piggybacks
-	// directly on its entry instead of a separate bookkeeping version —
-	// moving it last in the process (see applyCommentTriggers' doc
-	// comment for why a separate, always-last bookkeeping entry is unsafe).
-	if len(versions) != n {
-		t.Fatalf("got %d versions, want exactly %d (no extra appends expected): %+v", len(versions), n, versions)
+	// One extra version is appended: a standalone bookkeeping version
+	// carrying the table. cursorPR's own entry is updated in place (it was
+	// already present), but — unlike an earlier, unsafe design — it never
+	// carries CommentWatermarks itself, so its shape can't toggle across
+	// checks depending on whether it happens to be the carrier (see
+	// applyCommentTriggers' doc comment).
+	if len(versions) != n+1 {
+		t.Fatalf("got %d versions, want exactly %d (every PR plus one bookkeeping version): %+v", len(versions), n+1, versions)
 	}
 
 	// Every PR's own entry must carry its own freshly observed comment id
@@ -907,13 +1027,20 @@ func TestApplyCommentTriggers_ManyPRsConcurrently(t *testing.T) {
 		}
 	}
 
-	// cursorPR's entry — now the last one — carries the full watermark
-	// table for every PR, not just its own, so each one's baseline is
-	// recoverable on a future check regardless of which PR cursorPR ends
-	// up being next.
-	sentinel := versions[n-1]
-	if sentinel.PR != strconv.Itoa(cursorPR) {
-		t.Fatalf("versions[%d].PR = %s, want cursorPR %d to carry the table as the last entry", n-1, sentinel.PR, cursorPR)
+	// No real PR's entry carries CommentWatermarks — only the standalone
+	// bookkeeping version does, and it carries the full watermark table
+	// for every PR, so each one's baseline is recoverable on a future
+	// check.
+	for i := range n {
+		number := i + 1
+		v := byPR[strconv.Itoa(number)]
+		if v.CommentWatermarks != nil {
+			t.Errorf("PR #%d: CommentWatermarks = %v, want nil — must never carry the shared table", number, v.CommentWatermarks)
+		}
+	}
+	sentinel, ok := byPR[sentinelPR]
+	if !ok {
+		t.Fatalf("expected a standalone bookkeeping version, got %+v", versions)
 	}
 	for i := range n {
 		number := i + 1
@@ -1500,9 +1627,10 @@ func TestCheck_MultipleCommitsAndNewPROpenedInSameCheck(t *testing.T) {
 //     comment — both must fire; neither may be silently dropped in favor
 //     of the other (the exact bug a shared, single-cursor table caused).
 //
-// Since #40/#50 triggering already provides an independently-new entry to
-// carry the table, PR #30 joining the tracked set rides along for free —
-// no separate bookkeeping version should be needed at all this time.
+// PR #30 joining the tracked set, together with #40/#50's new watermarks,
+// changes the table — which always goes to its own standalone bookkeeping
+// version, never piggybacked onto #40 or #50's own (already independently
+// new) entries.
 func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
 	type prFixture struct {
 		number        int
@@ -1587,17 +1715,26 @@ func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
 		byPR[v.PR] = v
 	}
 
-	// No separate bookkeeping version: #40/#50 triggering already
-	// provides a carrier, so PR #30 joining the table rides along for free.
-	if _, ok := byPR[sentinelPR]; ok {
-		t.Errorf("unexpected standalone bookkeeping version — a trigger already provides a carrier this cycle: %+v", versions)
+	// A standalone bookkeeping version always carries the table — even
+	// though #40/#50 triggering gives a real, independently-new entry
+	// this cycle, it's never used as a carrier (see applyCommentTriggers'
+	// doc comment for why piggybacking on it is unsafe: that entry would
+	// then toggle shape across checks depending on whether it happens to
+	// be the carrier, which Concourse treats as a new version and
+	// rebuilds an already-built, unchanged PR).
+	sentinel, ok := byPR[sentinelPR]
+	if !ok {
+		t.Fatalf("expected a standalone bookkeeping version carrying the table, got %+v", versions)
 	}
-	if len(versions) != len(prs) {
-		t.Fatalf("got %d versions, want exactly %d (one per real PR, no extras): %+v", len(versions), len(prs), versions)
+	if len(versions) != len(prs)+1 {
+		t.Fatalf("got %d versions, want exactly %d (one per real PR plus one bookkeeping version): %+v", len(versions), len(prs)+1, versions)
 	}
 
 	wantTable := map[string]int64{"10": 100, "20": 200, "30": 0, "40": 401, "50": 501}
-	var carrierPR string
+	if !maps.Equal(sentinel.CommentWatermarks, wantTable) {
+		t.Errorf("bookkeeping CommentWatermarks = %v, want %v", sentinel.CommentWatermarks, wantTable)
+	}
+
 	for _, pr := range prs {
 		prKey := strconv.Itoa(pr.number)
 		v, ok := byPR[prKey]
@@ -1612,8 +1749,8 @@ func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
 		// triggered or not (see TestApplyCommentTriggers_ManyPRsConcurrently).
 		// For #10/#20/#30 that's their unchanged (or, for #30, baseline)
 		// id; "perturbed" here specifically means picking up something
-		// that isn't its own — e.g. the shared table, checked separately
-		// below.
+		// that isn't its own — e.g. the shared table, which no real PR's
+		// entry ever carries, checked separately below.
 		if v.CommentID != pr.newCommentID {
 			t.Errorf("PR #%d: CommentID = %d, want %d", pr.number, v.CommentID, pr.newCommentID)
 		}
@@ -1621,16 +1758,7 @@ func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
 			t.Errorf("PR #%d: CommentBaseline = false, want true", pr.number)
 		}
 		if v.CommentWatermarks != nil {
-			if carrierPR != "" {
-				t.Fatalf("more than one version carries CommentWatermarks — PR #%s and PR #%d: %+v", carrierPR, pr.number, versions)
-			}
-			carrierPR = prKey
-			if !maps.Equal(v.CommentWatermarks, wantTable) {
-				t.Errorf("PR #%d (carrier) CommentWatermarks = %v, want %v", pr.number, v.CommentWatermarks, wantTable)
-			}
+			t.Errorf("PR #%d: CommentWatermarks = %v, want nil — must never carry the shared table", pr.number, v.CommentWatermarks)
 		}
-	}
-	if carrierPR == "" {
-		t.Error("expected exactly one triggered PR's version to carry the full watermark table, found none")
 	}
 }
