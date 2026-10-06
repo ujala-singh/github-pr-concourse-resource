@@ -81,6 +81,15 @@ func TestCommonConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "draft is a valid state",
+			config: CommonConfig{
+				Repository:  "owner/repo",
+				AccessToken: "token123",
+				States:      []string{"DRAFT"},
+			},
+			wantErr: false,
+		},
+		{
 			name: "unset check_concurrency uses default",
 			config: CommonConfig{
 				Repository:  "owner/repo",

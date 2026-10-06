@@ -44,10 +44,10 @@ type CommonConfig struct {
 	// plans via a PR comment such as "concourse plan --all".
 	//
 	// Supported in both single-PR mode (pr package) and PR-list mode (prlist
-	// package). In list mode this is best-effort: the resource's version
-	// stream only tracks a single cursor across many PRs, so once the cursor
-	// moves on to a different PR, that PR's comment watermark is lost until
-	// it's re-established — see prlist.applyCommentTriggers.
+	// package). In list mode, each PR's comment watermark is tracked
+	// independently via a shared table that survives regardless of which
+	// PR's version Concourse happens to remember as "latest" between
+	// checks — see prlist.applyCommentTriggers.
 	TriggerComments []string `json:"trigger_comments"`
 	// CheckConcurrency bounds how many PRs are inspected in parallel during a
 	// single PR-list mode check (path filtering, comment scanning). Ignored
@@ -115,12 +115,15 @@ func (c *CommonConfig) Validate() error {
 		}
 	}
 
-	// Validate states
+	// Validate states. DRAFT is a pseudo-state: GitHub's real PullRequestState
+	// GraphQL enum only has OPEN/MERGED/CLOSED — draft-ness is the separate
+	// IsDraft field on an OPEN PR — so GetPullRequests queries OPEN and
+	// filters by IsDraft to honor it; see shouldSkipPR.
 	if len(c.States) > 0 {
-		validStates := map[string]bool{"OPEN": true, "MERGED": true, "CLOSED": true}
+		validStates := map[string]bool{"OPEN": true, "MERGED": true, "CLOSED": true, "DRAFT": true}
 		for _, state := range c.States {
 			if !validStates[strings.ToUpper(state)] {
-				return fmt.Errorf("invalid state: %s (must be OPEN, MERGED, or CLOSED)", state)
+				return fmt.Errorf("invalid state: %s (must be OPEN, CLOSED, MERGED, or DRAFT)", state)
 			}
 		}
 	}
