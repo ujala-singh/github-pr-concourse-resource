@@ -266,24 +266,32 @@ type Version struct {
 	// as "latest" in between (Concourse's check protocol only ever hands
 	// back that one version, not a per-PR history).
 	//
-	// It's nil on the vast majority of versions — it's only ever attached
-	// to one version per check, and only on checks where the table
-	// actually changed, to the entry that's ALREADY independently new
-	// that cycle for its own reason (a real trigger, or a brand-new PR's
-	// first-ever version). When nothing else is changing, it falls back
+	// It's nil on the vast majority of versions: it's only ever attached
 	// to prlist's dedicated bookkeeping version (PR == a reserved
-	// sentinel, never a real GitHub PR number — see prlist.sentinelPR).
-	// It is never attached to an otherwise-unrelated, unchanged PR's
-	// version. Two earlier designs got this wrong: one embedded the table
-	// on EVERY real PR's version (one PR's watermark changing, even just
-	// that PR closing, made every other open PR's version look different
-	// too, spuriously rebuilding already-built commits); another always
-	// appended a dedicated bookkeeping version LAST on every single
-	// check, which — confirmed live — permanently buried any real commit
-	// landing in the same or a later check, since Concourse re-ranks a
-	// check's last returned element as "current" ahead of everything
-	// else. Attaching it only when something changed, and preferring an
-	// already-legitimately-new entry over a standalone one, avoids both.
+	// sentinel, never a real GitHub PR number — see prlist.sentinelPR),
+	// and only on checks where the table actually changed. It is NEVER
+	// attached to a real PR's own version, not even one that's already
+	// independently new this cycle for its own reason (a real trigger, or
+	// a brand-new PR's first-ever version) — that was tried as an
+	// optimization to skip the extra bookkeeping build, but confirmed
+	// live it's unsafe: that real PR's version then toggles between
+	// carrying the table and not, cycle to cycle, purely based on which
+	// PR happens to be picked as that cycle's carrier, even though
+	// nothing about the PR itself changed. Concourse diffs the full
+	// version map, so that bare presence/absence alone made an
+	// already-built, unchanged PR look like a new version and rebuilt it
+	// (confirmed live: PR #43 on concourse-ci-poc, 2026-10-07). Two
+	// earlier designs got it wrong in other ways too: one embedded the
+	// table on EVERY real PR's version (one PR's watermark changing, even
+	// just that PR closing, made every other open PR's version look
+	// different too); another always appended the bookkeeping version
+	// LAST on every single check, which — confirmed live — permanently
+	// buried any real commit landing in the same or a later check, since
+	// Concourse re-ranks a check's last returned element as "current"
+	// ahead of everything else. A real PR's version is built from only
+	// that PR's own data, full stop; the table lives solely on the
+	// standalone bookkeeping version, unconditionally, whenever it
+	// changes.
 	CommentWatermarks map[string]int64 `json:"-"`
 }
 

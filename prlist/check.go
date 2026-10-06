@@ -174,48 +174,51 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // A real PR's own CommentID/CommentBaseline still describes only that one
 // PR — nothing about PR B's version ever depends on PR A's data — so
 // those fields are never perturbed by another PR's activity, including
-// that PR closing. Earlier designs got this wrong in different ways: one
-// embedded a shared, multi-PR table directly on every real PR's version
-// (any PR's watermark changing made every other one look new and
-// rebuilt its already-built commit); another dropped the shared table
-// entirely in favor of a single implicit cursor (request.Version.PR),
-// which meant commenting on two different PRs within the same check
-// window silently dropped whichever one wasn't already the cursor; a
-// third always appended a dedicated bookkeeping version (PR ==
-// sentinelPR) LAST on every single check, which broke plain
-// commit-triggering: confirmed live, Concourse treats a check's last
-// returned element as "current," and re-ranks even an unchanged entry
-// ahead of others whenever it reappears, so an always-last bookkeeping
-// version permanently buried any real commit that landed in the same or
-// a later check cycle — the commit was correctly recorded in history but
-// never actually built.
+// that PR closing. The shared comment-trigger watermark table
+// (CommentWatermarks) is handled completely separately, and is NEVER
+// attached to a real PR's version — only ever to a dedicated, standalone
+// bookkeeping version (PR == sentinelPR). Earlier designs got this wrong
+// in different ways: one embedded the shared table directly on every
+// real PR's version (any PR's watermark changing made every other one
+// look new and rebuilt its already-built commit); another dropped the
+// shared table entirely in favor of a single implicit cursor
+// (request.Version.PR), which meant commenting on two different PRs
+// within the same check window silently dropped whichever one wasn't
+// already the cursor; a third always appended the bookkeeping version
+// LAST on every single check, which broke plain commit-triggering:
+// confirmed live, Concourse treats a check's last returned element as
+// "current," and re-ranks even an unchanged entry ahead of others
+// whenever it reappears, so an always-last bookkeeping version
+// permanently buried any real commit that landed in the same or a later
+// check cycle — the commit was correctly recorded in history but never
+// actually built. A fourth piggybacked the table onto whichever real
+// PR's version was "already, unambiguously new this cycle for its own
+// reason" (a genuine comment trigger), to avoid the extra bookkeeping
+// build — this looked safe, since that PR's version genuinely was new
+// regardless, but confirmed live it wasn't: that same PR, on a LATER
+// check, reappeared with the identical commit and identical
+// latest-comment-match id, just without CommentWatermarks attached
+// (because some other PR carried the table that cycle instead, or
+// nothing needed recording at all). Concourse diffs on the full version
+// map, so "has CommentWatermarks" vs. "doesn't," alone, made an
+// already-built, completely unchanged PR look like a brand-new version —
+// and it was built again: a real, wasted rebuild, not a cosmetic one (PR
+// #43 on concourse-ci-poc re-ran its terraform plan this way, set off by
+// an unrelated commit to PR #42 that merely made the table need
+// re-recording).
 //
-// This version only touches the shared table on a check where it
-// genuinely changed, and even then only piggybacks it onto a PR's entry
-// when that PR is ALREADY, unambiguously new this cycle for its own
-// reason: it has a genuine trigger. Everything else — a PR closing, a
-// brand-new PR appearing without yet triggering, or simply the previous
-// "latest" version happening to be a plain commit that carries no table
-// at all (in which case tracked looks empty even though nothing is
-// actually new) — falls back to a standalone bookkeeping version, never
-// to piggybacking on an arbitrary existing entry. An intermediate design
-// tried to also piggyback whenever a key was absent from tracked,
-// treating that as "a brand-new PR, safe to attach to" — but an absent
-// key is also exactly what a plain-commit "latest" version produces for
-// every PR, so that version — confirmed live — attached the table to a
-// stable, already-built PR's version essentially at random, spuriously
-// rebuilding it. There's no way to tell "genuinely new" apart from
-// "merely unrecoverable right now" from inside this function, so only
-// the unambiguous signal (a real trigger) is trusted to piggyback; this
-// costs one extra, harmless bookkeeping build the first time the table
-// needs re-establishing after a plain commit, which is a small, bounded
-// price for never again risking an unrelated PR's version. A plain new
-// commit, with no comment activity involved, is never touched by any of
-// this: it flows through untouched and is free to be the check's last
-// element, so Concourse builds it normally. request.Version.CommentWatermarks
-// is read regardless of which PR that version happens to be about — it's
-// never restricted to only the bookkeeping version — since a piggybacked
-// real PR version carries it just as well.
+// So: a real PR's version is built from ONLY that PR's own data, full
+// stop — nothing here can ever make its shape depend on what any other
+// PR, or the bookkeeping table, happens to be doing this cycle. Whenever
+// the table changes, it's recorded on a standalone bookkeeping version,
+// unconditionally — the bounded cost is that this bookkeeping version
+// might also need building (harmless; see the COMMENT_TRIGGER_BOOKKEEPING
+// skip in consuming pipelines), never a real PR's. A plain new commit,
+// with no comment activity involved, is never touched by any of this: it
+// flows through untouched and is free to be the check's last element, so
+// Concourse builds it normally. request.Version.CommentWatermarks is read
+// regardless of which PR that version happens to be about, though in
+// practice it is always the bookkeeping version now.
 func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
 	var tracked map[string]int64
 	if request.Version != nil {
@@ -294,21 +297,11 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		}
 	}
 
-	anyTriggered := false
-	for _, r := range results {
-		if r.triggered {
-			anyTriggered = true
-			break
-		}
-	}
-
-	triggeredPRs := make(map[string]bool)
 	for _, r := range results {
 		if !r.triggered {
 			continue
 		}
 		prKey := strconv.Itoa(r.pr.Number)
-		triggeredPRs[prKey] = true
 		if present[prKey] {
 			// Already stamped in place above — don't duplicate the entry.
 			continue
@@ -327,68 +320,31 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	// table) only needs to be recorded somewhere when it actually changed.
 	// Recomputing and re-returning an unchanged table costs nothing in
 	// theory, but re-touches whatever carries it every single check — see
-	// the doc comment above for why that broke real commit-triggering.
+	// the doc comment above for why that broke real commit-triggering. It
+	// is NEVER attached to a real PR's version (see the doc comment above
+	// for why that's unsafe even when that PR is already, independently
+	// new this cycle) — only ever to a standalone bookkeeping version.
 	if !maps.Equal(tracked, newTable) {
-		attached := false
-		if anyTriggered {
-			// A triggered PR's entry is already genuinely new this cycle
-			// — piggyback the table there. It isn't necessarily the LAST
-			// entry already (e.g. a triggered PR that was already present
-			// among the base versions is stamped in place, not appended),
-			// so find it and move it last explicitly rather than assuming
-			// position — attaching the table to whatever happens to be
-			// last would risk landing on an unrelated, unchanged PR.
-			for j := range versions {
-				if !triggeredPRs[versions[j].PR] {
-					continue
-				}
-				versions[j].CommentWatermarks = newTable
-				last := len(versions) - 1
-				versions[j], versions[last] = versions[last], versions[j]
-				attached = true
-				break
-			}
+		// Except on this resource's very first-ever check
+		// (request.Version == nil) when real PR entries are ALSO present:
+		// Concourse always starts a brand-new resource from whatever
+		// check returns as its LAST array element, even with
+		// version: every — confirmed live — so appending the sentinel
+		// after a real PR's first-ever entry would make Concourse treat
+		// THAT entry as pre-existing history to skip, not build, exactly
+		// as it deliberately does for a freshly added git-resource with
+		// 1000 existing commits. Skipping the sentinel here costs
+		// nothing: there's no prior table to lose on a cold start, and
+		// the very next check — no longer a cold start — can safely
+		// record it below.
+		if request.Version == nil && len(versions) > 0 {
+			return versions, nil
 		}
-		if !attached {
-			// Nothing else is independently new this cycle to safely
-			// piggyback on. This covers several cases that all share the
-			// same shape — a PR closed/merged, a brand-new PR entered
-			// scope without yet triggering, or simply the previous
-			// version happened to be a plain commit that didn't carry the
-			// table (so tracked looks "empty" even though nothing is
-			// actually new) — and in every one of them, there's no way to
-			// tell "genuinely new" apart from "merely unrecoverable right
-			// now" from inside this function. Treating every key absent
-			// from tracked as "new" and piggybacking on it was tried and
-			// is unsafe: confirmed live, it attached the table to a
-			// completely stable, unrelated PR's version whenever the
-			// table simply hadn't been recoverable, spuriously rebuilding
-			// its already-built commit. A standalone bookkeeping version
-			// is the only way to persist the table without ever risking
-			// that — it's the sole new thing this cycle, so it's safe for
-			// it to be last.
-			//
-			// Except on this resource's very first-ever check
-			// (request.Version == nil) when real PR entries are ALSO
-			// present: Concourse always starts a brand-new resource from
-			// whatever check returns as its LAST array element, even with
-			// version: every — confirmed live — so appending the sentinel
-			// after a real PR's first-ever entry would make Concourse
-			// treat THAT entry as pre-existing history to skip, not build,
-			// exactly as it deliberately does for a freshly added
-			// git-resource with 1000 existing commits. Skipping the
-			// sentinel here costs nothing: there's no prior table to lose
-			// on a cold start, and the very next check — no longer a cold
-			// start — can safely record it via the normal paths above.
-			if request.Version == nil && len(versions) > 0 {
-				return versions, nil
-			}
-			versions = append(versions, models.Version{
-				PR:                sentinelPR,
-				CommentBaseline:   true,
-				CommentWatermarks: newTable,
-			})
-		}
+		versions = append(versions, models.Version{
+			PR:                sentinelPR,
+			CommentBaseline:   true,
+			CommentWatermarks: newTable,
+		})
 	}
 
 	return versions, nil
