@@ -1837,3 +1837,204 @@ func TestCheck_CommitsNewPRAndCommentTriggers_AllInOneCheck(t *testing.T) {
 		}
 	}
 }
+
+// TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently
+// is a larger-scale regression test combining everything that can happen
+// within one ~1-minute check window: 5 PRs each get a genuine new commit,
+// 3 different PRs each get a genuine new matching comment (no commit
+// change), and 2 previously-tracked PRs are merged/closed (so GitHub
+// simply stops returning them as OPEN this check). All ten events are
+// independent of each other.
+//
+// Every one of the 8 real PRs must end up with its own correct version —
+// none silently dropped, none perturbed by another PR's event — and the
+// 3 comment-triggered PRs must land after all 5 commit PRs in the
+// returned array, since a comment doesn't bump CommittedDate and
+// wouldn't otherwise sort last (see sortVersionsByRecency and the
+// trigger-partition in applyCommentTriggers). The 2 merges must simply
+// drop out of the tracked table without otherwise disturbing anything.
+func TestCheck_ManySimultaneousCommitsCommentsAndMerges_AllFireIndependently(t *testing.T) {
+	type commitFixture struct {
+		number        int
+		headSHA       string
+		committedDate string
+	}
+	// PRs #1-5 each get a brand-new commit this check.
+	commitPRs := []commitFixture{
+		{number: 1, headSHA: "sha-1-new", committedDate: "2026-10-07T10:00:01Z"},
+		{number: 2, headSHA: "sha-2-new", committedDate: "2026-10-07T10:00:02Z"},
+		{number: 3, headSHA: "sha-3-new", committedDate: "2026-10-07T10:00:03Z"},
+		{number: 4, headSHA: "sha-4-new", committedDate: "2026-10-07T10:00:04Z"},
+		{number: 5, headSHA: "sha-5-new", committedDate: "2026-10-07T10:00:05Z"},
+	}
+	type commentFixture struct {
+		number        int
+		headSHA       string // unchanged this check
+		committedDate string // deliberately old — the comment is the only new thing
+		oldCommentID  int64
+		newCommentID  int64
+	}
+	// PRs #6-8 each get a genuine new matching comment; their commit is
+	// untouched.
+	commentPRs := []commentFixture{
+		{number: 6, headSHA: "sha-6-old", committedDate: "2026-09-01T00:00:00Z", oldCommentID: 600, newCommentID: 601},
+		{number: 7, headSHA: "sha-7-old", committedDate: "2026-09-01T00:00:00Z", oldCommentID: 700, newCommentID: 701},
+		{number: 8, headSHA: "sha-8-old", committedDate: "2026-09-01T00:00:00Z", oldCommentID: 800, newCommentID: 801},
+	}
+	// PRs #9-10 were previously tracked but are merged/closed as of this
+	// check — GitHub simply stops returning them as OPEN at all.
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		var edges []string
+		for _, pr := range commitPRs {
+			edges = append(edges, fmt.Sprintf(`{"node":{
+				"number": %d, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+				"baseRefName": "main", "headRefName": "f", "headRefOid": %q,
+				"repository": {"url": "u"}, "headRepository": {"url": "u"},
+				"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+				"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": %q, "additions": 1, "deletions": 0}}]},
+				"reviews": {"nodes": []}
+			}}`, pr.number, pr.headSHA, pr.headSHA, pr.committedDate))
+		}
+		for _, pr := range commentPRs {
+			edges = append(edges, fmt.Sprintf(`{"node":{
+				"number": %d, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+				"baseRefName": "main", "headRefName": "f", "headRefOid": %q,
+				"repository": {"url": "u"}, "headRepository": {"url": "u"},
+				"author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+				"commits": {"nodes": [{"commit": {"oid": %q, "committedDate": %q, "additions": 1, "deletions": 0}}]},
+				"reviews": {"nodes": []}
+			}}`, pr.number, pr.headSHA, pr.headSHA, pr.committedDate))
+		}
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`,
+			strings.Join(edges, ","))
+	})
+	for _, pr := range commitPRs {
+		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprint(w, `[]`)
+		})
+	}
+	for _, pr := range commentPRs {
+		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, pr.oldCommentID, pr.newCommentID)
+		})
+	}
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+	baseURL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	v3.BaseURL = baseURL
+
+	gc := &models.GithubClient{
+		V3: v3,
+		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+		Config: models.CommonConfig{
+			Repository:      "owner/repo",
+			TriggerComments: []string{"concourse plan"},
+			// No Paths: every PR matches unconditionally.
+		},
+	}
+
+	tracked := map[string]int64{
+		"6": 600, "7": 700, "8": 800, // baselines established for the comment PRs
+		"9": 900, "10": 1000, // baselines for the two about-to-be-merged PRs
+	}
+	request := CheckRequest{
+		Source: Source{CommonConfig: gc.Config},
+		Version: &models.Version{
+			PR: sentinelPR, CommentBaseline: true,
+			CommentWatermarks: tracked,
+		},
+	}
+
+	versions, err := Check(request, gc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(versions) != 9 { // 5 commit PRs + 3 comment PRs + 1 bookkeeping
+		t.Fatalf("got %d versions, want exactly 9: %+v", len(versions), versions)
+	}
+
+	indexOf := make(map[string]int, len(versions))
+	byPR := make(map[string]models.Version, len(versions))
+	for i, v := range versions {
+		indexOf[v.PR] = i
+		byPR[v.PR] = v
+	}
+
+	// All 5 commit PRs fired with their new commit, untouched by anything
+	// else.
+	for _, pr := range commitPRs {
+		prKey := strconv.Itoa(pr.number)
+		v, ok := byPR[prKey]
+		if !ok {
+			t.Fatalf("no version found for commit PR #%d: %+v", pr.number, versions)
+		}
+		if v.Commit != pr.headSHA {
+			t.Errorf("PR #%d: Commit = %s, want %s", pr.number, v.Commit, pr.headSHA)
+		}
+		if v.CommentWatermarks != nil {
+			t.Errorf("PR #%d: CommentWatermarks = %v, want nil", pr.number, v.CommentWatermarks)
+		}
+	}
+
+	// All 3 comment PRs fired with their new comment id, commit untouched.
+	for _, pr := range commentPRs {
+		prKey := strconv.Itoa(pr.number)
+		v, ok := byPR[prKey]
+		if !ok {
+			t.Fatalf("no version found for comment PR #%d: %+v", pr.number, versions)
+		}
+		if v.CommentID != pr.newCommentID {
+			t.Errorf("PR #%d: CommentID = %d, want %d", pr.number, v.CommentID, pr.newCommentID)
+		}
+		if v.Commit != pr.headSHA {
+			t.Errorf("PR #%d: Commit = %s, want %s (comment trigger must not alter an unrelated field)", pr.number, v.Commit, pr.headSHA)
+		}
+		if v.CommentWatermarks != nil {
+			t.Errorf("PR #%d: CommentWatermarks = %v, want nil", pr.number, v.CommentWatermarks)
+		}
+	}
+
+	// Every comment-triggered PR must be positioned after every
+	// commit-only PR, since Concourse decides what's "current" purely by
+	// final array position and a comment doesn't bump CommittedDate.
+	maxCommitIndex := -1
+	for _, pr := range commitPRs {
+		if idx := indexOf[strconv.Itoa(pr.number)]; idx > maxCommitIndex {
+			maxCommitIndex = idx
+		}
+	}
+	for _, pr := range commentPRs {
+		if idx := indexOf[strconv.Itoa(pr.number)]; idx < maxCommitIndex {
+			t.Errorf("comment-triggered PR #%d at index %d is positioned before commit PR at index %d — risks being buried",
+				pr.number, idx, maxCommitIndex)
+		}
+	}
+
+	// The two merged PRs simply disappear — no version, no error — and
+	// the bookkeeping version (always last) reflects their baselines
+	// dropping out of the table without otherwise being perturbed.
+	for _, merged := range []string{"9", "10"} {
+		if _, ok := byPR[merged]; ok {
+			t.Errorf("merged PR #%s unexpectedly has its own version: %+v", merged, versions)
+		}
+	}
+	sentinel, ok := byPR[sentinelPR]
+	if !ok {
+		t.Fatalf("expected a standalone bookkeeping version, got %+v", versions)
+	}
+	if indexOf[sentinelPR] != len(versions)-1 {
+		t.Errorf("bookkeeping version is not last: index %d of %d", indexOf[sentinelPR], len(versions))
+	}
+	wantTable := map[string]int64{"1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 601, "7": 701, "8": 801}
+	if !maps.Equal(sentinel.CommentWatermarks, wantTable) {
+		t.Errorf("bookkeeping CommentWatermarks = %v, want %v (PRs #9/#10 must drop out)", sentinel.CommentWatermarks, wantTable)
+	}
+}
