@@ -251,12 +251,35 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // the table changes, it's recorded on a standalone bookkeeping version,
 // unconditionally — the bounded cost is that this bookkeeping version
 // might also need building (harmless; see the COMMENT_TRIGGER_BOOKKEEPING
-// skip in consuming pipelines), never a real PR's. A plain new commit,
-// with no comment activity involved, is never touched by any of this: it
-// flows through untouched and is free to be the check's last element, so
-// Concourse builds it normally. request.Version.CommentWatermarks is read
-// regardless of which PR that version happens to be about, though in
-// practice it is always the bookkeeping version now.
+// skip in consuming pipelines), never a real PR's.
+//
+// That bookkeeping version is PREPENDED, not appended — confirmed live
+// (2026-10-07, PR #42 on concourse-ci-poc): the table needing
+// re-recording doesn't require any comment to have actually changed; it
+// also happens whenever request.Version (whatever this resource's
+// last-known version was going into THIS check) turns out to be a plain
+// real-PR version, which never carries CommentWatermarks, making
+// `tracked` look empty/unrecoverable on its own. That can coincide, in
+// the very same check, with a genuinely new, unrelated real commit —
+// one Check's sortVersionsByRecency correctly placed last in `versions`
+// specifically to win Concourse's "last element is current" ranking.
+// Appending the bookkeeping version after it would instantly undo that:
+// it's itself a new row whenever its content changes, so it would land
+// last and outrank that real commit — the exact same "always-last
+// bookkeeping version buries real commits" failure already described
+// above for the third design, just reached by a different, non-comment
+// trigger. Prepending it instead leaves every real entry's relative,
+// recency-sorted order untouched, so whichever one is genuinely newest
+// still wins — the bookkeeping version still gets its own harmless
+// build, just never at a real one's expense. A plain new commit, with
+// no comment activity involved, is never touched by any of this beyond
+// its position relative to the (possibly prepended) bookkeeping
+// version: it flows through untouched, free to be the check's last
+// element, so Concourse builds it normally. request.Version.CommentWatermarks
+// is read regardless of which PR that version happens to be about — in
+// steady state it's now frequently a real PR's, not always the
+// bookkeeping version's, precisely because prepending lets real commits
+// legitimately win "latest" instead of it.
 func applyCommentTriggers(ctx context.Context, request CheckRequest, github *models.GithubClient, allPRs []*models.PullRequest, versions []models.Version, concurrency int) ([]models.Version, error) {
 	var tracked map[string]int64
 	if request.Version != nil {
@@ -388,7 +411,7 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		// (request.Version == nil) when real PR entries are ALSO present:
 		// Concourse always starts a brand-new resource from whatever
 		// check returns as its LAST array element, even with
-		// version: every — confirmed live — so appending the sentinel
+		// version: every — confirmed live — so the sentinel landing
 		// after a real PR's first-ever entry would make Concourse treat
 		// THAT entry as pre-existing history to skip, not build, exactly
 		// as it deliberately does for a freshly added git-resource with
@@ -399,11 +422,35 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 		if request.Version == nil && len(versions) > 0 {
 			return versions, nil
 		}
-		versions = append(versions, models.Version{
+
+		sentinel := models.Version{
 			PR:                sentinelPR,
 			CommentBaseline:   true,
 			CommentWatermarks: newTable,
-		})
+		}
+
+		// Confirmed live (2026-10-07, PR #42 on concourse-ci-poc): the
+		// table needing to be re-recorded doesn't require anything about
+		// comments to have actually changed — it also happens whenever
+		// request.Version (this resource's last-known version going into
+		// THIS check) turns out to be a plain real-PR version, which
+		// never carries CommentWatermarks by design, making `tracked`
+		// look empty/unrecoverable even though nothing new is going on.
+		// That can coincide, in the very same check, with a genuinely
+		// new, unrelated real commit — one sortVersionsByRecency
+		// correctly placed last in `versions`, specifically so it would
+		// win Concourse's "last element is current" ranking. Appending
+		// the sentinel after it would instantly undo that: the sentinel
+		// is itself a brand-new row every time its content changes, so
+		// it would land last and outrank that real commit, burying it —
+		// the exact same "always-last bookkeeping version buries real
+		// commits" failure already fixed for cold start, just via a
+		// different trigger. Prepending it instead keeps every real
+		// entry's relative, recency-sorted order intact, so whichever
+		// one is genuinely newest still ends up last and wins — the
+		// sentinel still gets its own harmless build (it's still a new
+		// row), just never at the cost of a real one.
+		versions = append([]models.Version{sentinel}, versions...)
 	}
 
 	return versions, nil

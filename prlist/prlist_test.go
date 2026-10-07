@@ -651,6 +651,71 @@ func TestApplyCommentTriggers_UnrecoverableTable_FallsBackToSentinel_NeverPiggyb
 	}
 }
 
+// TestApplyCommentTriggers_UnrecoverableTableNeverBuriesPlainNewCommit is a
+// regression test for a live bug found on PR #42 of concourse-ci-poc on
+// 2026-10-07: a genuinely new commit stopped auto-triggering a build at
+// all, even on a manually forced check. The cause: request.Version (this
+// resource's last-known version going into this check) was itself a
+// plain real-PR version — which never carries CommentWatermarks, by
+// design — making the table look unrecoverable even though nothing about
+// any PR's comments had changed. That coincided with PR #42 getting a
+// genuine new commit in the very same check — one Check's
+// sortVersionsByRecency correctly placed last, specifically to win
+// Concourse's "last element is current" ranking. The (then-)current code
+// unconditionally APPENDED the freshly re-established bookkeeping version
+// after it, which — confirmed live — outranked and buried that real
+// commit: a manually forced build picked up the bookkeeping version
+// instead of PR #42's actual new commit.
+//
+// The fix is to PREPEND the bookkeeping version instead, so it can never
+// land after a real entry that Check already, correctly, sorted last.
+func TestApplyCommentTriggers_UnrecoverableTableNeverBuriesPlainNewCommit(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 100, "body": "concourse plan"}]`)
+	})
+	mux.HandleFunc("/repos/owner/repo/issues/43/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 200, "body": "concourse plan"}]`)
+	})
+	gc := newTestGithubClient(t, mux)
+
+	pr42 := &models.PullRequest{Number: 42, HeadRefOID: "sha-42-new", CommittedDate: "2026-10-07T10:40:05Z"}
+	pr43 := &models.PullRequest{Number: 43, HeadRefOID: "sha-43-old", CommittedDate: "2026-10-06T18:18:30Z"}
+	// Mirrors Check's sortVersionsByRecency output: PR #43 (older,
+	// unchanged) first, PR #42 (brand-new commit this check) last.
+	baseVersions := []models.Version{
+		{PR: "43", Commit: "sha-43-old", CommittedDate: "2026-10-06T18:18:30Z"},
+		{PR: "42", Commit: "sha-42-new", CommittedDate: "2026-10-07T10:40:05Z"},
+	}
+
+	// request.Version is PR #42's own PRIOR plain-commit version — no
+	// CommentWatermarks at all, exactly like a real PR's entry always
+	// looks. Neither PR's comment id has changed (100, 200 are already
+	// fully up to date), so nothing about comments is actually new —
+	// only the table's recoverability is the issue.
+	request := CheckRequest{
+		Source:  Source{CommonConfig: gc.Config},
+		Version: &models.Version{PR: "42", Commit: "sha-42-old", CommentID: 100, CommentBaseline: true},
+	}
+
+	versions, err := applyCommentTriggers(
+		context.Background(), request, gc, []*models.PullRequest{pr42, pr43}, baseVersions, DefaultCheckConcurrency,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(versions) != 3 { // PR #42 + PR #43 + bookkeeping
+		t.Fatalf("got %d versions, want exactly 3: %+v", len(versions), versions)
+	}
+	if last := versions[len(versions)-1]; last.PR != "42" {
+		t.Fatalf(`last version = PR #%s, want PR #42 (its commit is the genuinely new one) — the bookkeeping version must never bury it: %+v`, last.PR, versions)
+	}
+	if first := versions[0]; first.PR != sentinelPR {
+		t.Errorf("bookkeeping version is not first (got PR #%s at index 0): %+v", first.PR, versions)
+	}
+}
+
 func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -1414,15 +1479,18 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 }
 
 // TestCheck_CommentTrigger_NonSentinelLastVersion_ReEstablishesBaseline
-// covers the one-time migration edge case: request.Version is some real
-// PR's own version (here, PR #20's), not the bookkeeping version. This can
-// only happen right after upgrading from a version of this resource that
-// predates the bookkeeping version, or on the very first-ever check — in
-// steady-state operation, applyCommentTriggers always appends the
-// bookkeeping version last, so it's always what Concourse remembers as
-// "latest" from the second check onward, and every tracked PR's baseline
-// (including PR #5's here) is always reliably recoverable from it
-// regardless of which PR last got a new commit.
+// covers the migration/steady-state edge case: request.Version is some
+// real PR's own version (here, PR #20's), not the bookkeeping version.
+// This can happen right after upgrading from a version of this resource
+// that predates the bookkeeping version, on the very first-ever check,
+// or simply because a real PR's commit legitimately sorted after the
+// bookkeeping version in some earlier check (the sentinel is prepended,
+// not appended — see applyCommentTriggers' doc comment — specifically so
+// a real commit is always free to end up "latest" instead of it). Either
+// way, whenever the bookkeeping version ISN'T what Concourse remembers as
+// latest, no PR's baseline is recoverable this check, and
+// applyCommentTriggers simply re-establishes it via a fresh bookkeeping
+// version — a bounded, harmless cost, not a correctness problem.
 //
 // Since watermarks are only ever read from the bookkeeping version,
 // request.Version being PR #20's own version instead means NO PR has a
@@ -2061,7 +2129,8 @@ func TestCheck_ManySimultaneousCommitsCommentsMergesAndNewPRs_AllFireIndependent
 	}
 
 	// The two merged PRs simply disappear — no version, no error — and
-	// the bookkeeping version (always last) reflects their baselines
+	// the bookkeeping version (prepended, not appended — see
+	// applyCommentTriggers' doc comment) reflects their baselines
 	// dropping out of the table without otherwise being perturbed.
 	for _, merged := range []string{"9", "10"} {
 		if _, ok := byPR[merged]; ok {
@@ -2072,8 +2141,11 @@ func TestCheck_ManySimultaneousCommitsCommentsMergesAndNewPRs_AllFireIndependent
 	if !ok {
 		t.Fatalf("expected a standalone bookkeeping version, got %+v", versions)
 	}
-	if indexOf[sentinelPR] != len(versions)-1 {
-		t.Errorf("bookkeeping version is not last: index %d of %d", indexOf[sentinelPR], len(versions))
+	// The sentinel is prepended, not appended — see sortVersionsByRecency
+	// and applyCommentTriggers' doc comments: appending it last would let
+	// it outrank whichever real entry is genuinely newest, burying it.
+	if indexOf[sentinelPR] != 0 {
+		t.Errorf("bookkeeping version is not first: index %d of %d", indexOf[sentinelPR], len(versions))
 	}
 	wantTable := map[string]int64{
 		"1": 0, "2": 0, "3": 0, "4": 0, "5": 0,
