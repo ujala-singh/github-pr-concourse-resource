@@ -652,9 +652,9 @@ func TestApplyCommentTriggers_UnrecoverableTable_FallsBackToSentinel_NeverPiggyb
 }
 
 // TestApplyCommentTriggers_UnrecoverableTableNeverBuriesPlainNewCommit is a
-// regression test for a live bug found on PR #42 of concourse-ci-poc on
-// 2026-10-07: a genuinely new commit stopped auto-triggering a build at
-// all, even on a manually forced check. The cause: request.Version (this
+// regression test for a live bug: a genuinely new commit stopped
+// auto-triggering a build at all, even on a manually forced check. The
+// cause: request.Version (this
 // resource's last-known version going into this check) was itself a
 // plain real-PR version — which never carries CommentWatermarks, by
 // design — making the table look unrecoverable even though nothing about
@@ -737,13 +737,13 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// The triggered PR's own version never carries CommentWatermarks — only
-	// a standalone bookkeeping version does, even though PR #42 is already
+	// a standalone bookkeeping version does, even though this PR is already
 	// independently new this cycle. Piggybacking the table onto a real PR's
 	// entry was tried and found unsafe live: that PR's version then toggles
 	// shape (with/without CommentWatermarks) across checks depending on
 	// whether it happens to be the carrier, which Concourse treats as a
 	// genuinely new version and rebuilds — see applyCommentTriggers' doc
-	// comment (PR #43 on concourse-ci-poc).
+	// comment.
 	if len(versions) != 2 {
 		t.Fatalf("expected the triggered PR version plus a standalone bookkeeping version, got %d: %+v", len(versions), versions)
 	}
@@ -773,9 +773,9 @@ func TestApplyCommentTriggers_NewCommentAfterBaseline_Fires(t *testing.T) {
 }
 
 // TestApplyCommentTriggers_RealPRNeverTogglesWatermarkOwnership is a
-// regression test for the exact live bug found on PR #42/#43 of
-// concourse-ci-poc on 2026-10-07: an earlier design piggybacked the
-// shared watermark table onto whichever real PR happened to trigger that
+// regression test for the exact live bug found against a running
+// multi-PR pipeline: an earlier design piggybacked the shared watermark
+// table onto whichever real PR happened to trigger that
 // cycle. PR #43 triggered on one check and carried the table; on a later
 // check PR #42 triggered instead and became the new carrier — so PR #43
 // reappeared with its IDENTICAL commit and comment id, just without
@@ -1386,12 +1386,12 @@ func TestCheck_RespectsConfiguredCheckConcurrency(t *testing.T) {
 }
 
 // TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths is a
-// regression test for a real production incident: PR #5 on
-// dbt-labs/dbt-concourse-config had an established baseline (it was the
-// resource's tracked cursor), then got a commit touching only the pipeline
-// bootstrap YAML — outside source.paths — followed by a genuine "concourse
-// plan" comment. Three consecutive forced checks against the real pipeline
-// never produced a new version.
+// regression test for a real production incident: a tracked PR had an
+// established baseline (it was the resource's tracked cursor), then got a
+// commit touching only the pipeline bootstrap YAML — outside
+// source.paths — followed by a genuine "concourse plan" comment. Three
+// consecutive forced checks against the real pipeline never produced a
+// new version.
 //
 // Root cause: filterPRsByPath correctly excludes a PR from the commit-
 // triggering set when its latest push doesn't touch a matching path (that
@@ -1683,8 +1683,8 @@ func TestCheck_MultipleCommitsAndNewPROpenedInSameCheck(t *testing.T) {
 }
 
 // TestCheck_MostRecentPushLandsLast_RegardlessOfPRCreationOrder is a
-// regression test for a live bug found on PR #42/#43 of concourse-ci-poc
-// on 2026-10-07: GitHub's GraphQL pullRequests connection defaults to
+// regression test for a live bug found against a running multi-PR
+// pipeline: GitHub's GraphQL pullRequests connection defaults to
 // CREATED_AT ascending with no orderBy override, so GetPullRequests' —
 // and therefore Check's — output was ordered by PR creation date, not by
 // recency of change. Concourse assigns check_order to a check's returned

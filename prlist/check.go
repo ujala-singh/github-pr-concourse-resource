@@ -100,9 +100,9 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	// alone, that means whichever open, path-matching PR happens to have
 	// been opened most recently always lands last and perpetually "wins"
 	// the current slot, starving every other PR's genuinely new commits
-	// from ever being recognized — confirmed live on concourse-ci-poc: PR
-	// #43 (opened after #42) kept outranking PR #42's actual new commit
-	// even across repeated forced re-checks. Sorting by CommittedDate
+	// from ever being recognized — confirmed live: a PR opened later kept
+	// outranking an older PR's actual new commit even across repeated
+	// forced re-checks. Sorting by CommittedDate
 	// instead aligns the array's order with actual code recency, so the
 	// PR that most recently pushed lands last and wins, regardless of
 	// which PR happens to have the newer number.
@@ -240,10 +240,9 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // nothing needed recording at all). Concourse diffs on the full version
 // map, so "has CommentWatermarks" vs. "doesn't," alone, made an
 // already-built, completely unchanged PR look like a brand-new version —
-// and it was built again: a real, wasted rebuild, not a cosmetic one (PR
-// #43 on concourse-ci-poc re-ran its terraform plan this way, set off by
-// an unrelated commit to PR #42 that merely made the table need
-// re-recording).
+// and it was built again: a real, wasted rebuild, not a cosmetic one (a
+// PR re-ran its terraform plan this way, set off by an unrelated commit
+// to a different PR that merely made the table need re-recording).
 //
 // So: a real PR's version is built from ONLY that PR's own data, full
 // stop — nothing here can ever make its shape depend on what any other
@@ -253,13 +252,13 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 // might also need building (harmless; see the COMMENT_TRIGGER_BOOKKEEPING
 // skip in consuming pipelines), never a real PR's.
 //
-// That bookkeeping version is PREPENDED, not appended — confirmed live
-// (2026-10-07, PR #42 on concourse-ci-poc): the table needing
-// re-recording doesn't require any comment to have actually changed; it
-// also happens whenever request.Version (whatever this resource's
-// last-known version was going into THIS check) turns out to be a plain
-// real-PR version, which never carries CommentWatermarks, making
-// `tracked` look empty/unrecoverable on its own. That can coincide, in
+// That bookkeeping version is PREPENDED, not appended — confirmed live:
+// the table needing re-recording doesn't require any comment to have
+// actually changed; it also happens whenever request.Version (whatever
+// this resource's last-known version was going into THIS check) turns
+// out to be a plain real-PR version, which never carries
+// CommentWatermarks, making `tracked` look empty/unrecoverable on its
+// own. That can coincide, in
 // the very same check, with a genuinely new, unrelated real commit —
 // one Check's sortVersionsByRecency correctly placed last in `versions`
 // specifically to win Concourse's "last element is current" ranking.
@@ -429,9 +428,9 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			CommentWatermarks: newTable,
 		}
 
-		// Confirmed live (2026-10-07, PR #42 on concourse-ci-poc): the
-		// table needing to be re-recorded doesn't require anything about
-		// comments to have actually changed — it also happens whenever
+		// Confirmed live: the table needing to be re-recorded doesn't
+		// require anything about comments to have actually changed — it
+		// also happens whenever
 		// request.Version (this resource's last-known version going into
 		// THIS check) turns out to be a plain real-PR version, which
 		// never carries CommentWatermarks by design, making `tracked`
