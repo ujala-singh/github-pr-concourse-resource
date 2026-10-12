@@ -604,9 +604,8 @@ func TestCheck_PathFilter_OnlyConsidersFilesChangedSinceLastCheck(t *testing.T) 
 
 // TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths is the
 // single-PR-mode counterpart to prlist's regression test of the same name,
-// reproducing a real production incident on PR #5 of
-// dbt-labs/dbt-concourse-config. A commit landed touching only the
-// pipeline's own bootstrap YAML (outside source.paths), followed by a
+// reproducing a real production incident: a commit landed touching only
+// the pipeline's own bootstrap YAML (outside source.paths), followed by a
 // genuine "concourse plan" comment — and the comment trigger never fired.
 //
 // Root cause here: when the path-filter check for a new, non-matching

@@ -280,7 +280,7 @@ type Version struct {
 	// nothing about the PR itself changed. Concourse diffs the full
 	// version map, so that bare presence/absence alone made an
 	// already-built, unchanged PR look like a new version and rebuilt it
-	// (confirmed live: PR #43 on concourse-ci-poc, 2026-10-07). Two
+	// (confirmed live against a running multi-PR pipeline). Two
 	// earlier designs got it wrong in other ways too: one embedded the
 	// table on EVERY real PR's version (one PR's watermark changing, even
 	// just that PR closing, made every other open PR's version look
