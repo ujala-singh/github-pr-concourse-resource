@@ -2,7 +2,6 @@ package pr
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,38 +25,28 @@ func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (Ou
 		}
 	}
 
-	// Read metadata from the source path
+	// The version the build's get fetched, from its signed version.json:
+	// the put reports on that PR and commit only, and returns that version
+	// unchanged. Nothing else in the working copy (the pr or head_sha
+	// files) is trusted, since tasks — and so a PR's own code — can change
+	// it; the signature (see models.WriteVersionSignature) can't be forged
+	// without this resource's credentials. Returning the version unchanged,
+	// rather than rebuilding it from the PR now (its head, commit date,
+	// approvals may have moved on), keeps the job's own put from looking
+	// like a new version and triggering the job again.
 	resourcePath := filepath.Join(sourcesDir, request.Params.Path, ".git", "resource")
-
-	versionFile := filepath.Join(resourcePath, "pr")
-	prBytes, err := os.ReadFile(versionFile)
+	version, err := models.ReadSignedVersion(resourcePath, request.Source.CommonConfig)
 	if err != nil {
-		return OutResponse{}, fmt.Errorf("failed to read pr number: %w", err)
+		return OutResponse{}, err
 	}
-	prNumber, err := strconv.Atoi(string(prBytes))
-	if err != nil {
-		return OutResponse{}, fmt.Errorf("invalid pr number: %w", err)
+	prNumber, err := strconv.Atoi(version.PR)
+	if err != nil || prNumber < 1 {
+		return OutResponse{}, fmt.Errorf("version names no PR: %q", version.PR)
 	}
-
-	commitFile := filepath.Join(resourcePath, "head_sha")
-	commitBytes, err := os.ReadFile(commitFile)
-	if err != nil {
-		return OutResponse{}, fmt.Errorf("failed to read commit sha: %w", err)
+	if request.Source.Number != 0 && prNumber != request.Source.Number {
+		return OutResponse{}, fmt.Errorf("the checkout is of PR #%d, but this resource is for PR #%d", prNumber, request.Source.Number)
 	}
-	commit := string(commitBytes)
-
-	// Recover the CommentID/CommentBaseline watermark from the version that
-	// triggered this build (written by In to version.json). Without this,
-	// Out's response version would always be missing these fields — making
-	// it look, byte-for-byte, like a brand-new version to Concourse's ATC
-	// and causing this job's own status-update `put` steps to re-trigger
-	// the same job on itself via the `get ... trigger: true` step.
-	var triggeringVersion models.Version
-	if versionJSON, err := os.ReadFile(filepath.Join(resourcePath, "version.json")); err == nil {
-		if err := json.Unmarshal(versionJSON, &triggeringVersion); err != nil {
-			return OutResponse{}, fmt.Errorf("failed to parse version.json: %w", err)
-		}
-	}
+	commit := version.Commit
 
 	// Get PR details
 	pr, err := github.GetPullRequest(ctx, prNumber)
@@ -118,20 +107,10 @@ func Out(request OutRequest, github *models.GithubClient, sourcesDir string) (Ou
 		}
 
 		if comment != "" {
-			if err := github.AddComment(ctx, prNumber, safeExpandEnv(comment)); err != nil {
+			if err := github.AddComment(ctx, prNumber, models.DefuseNoteMarkers(safeExpandEnv(comment))); err != nil {
 				return OutResponse{}, fmt.Errorf("failed to add comment: %w", err)
 			}
 		}
-	}
-
-	// Create response
-	version := models.Version{
-		PR:                  strconv.Itoa(pr.Number),
-		Commit:              commit,
-		CommittedDate:       pr.CommittedDate,
-		ApprovedReviewCount: pr.ApprovedReviewCount,
-		CommentID:           triggeringVersion.CommentID,
-		CommentBaseline:     triggeringVersion.CommentBaseline,
 	}
 
 	metadata := []models.Metadata{

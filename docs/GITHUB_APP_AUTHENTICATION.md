@@ -22,7 +22,7 @@ GitHub Apps offer several advantages over personal access tokens:
    - **Webhook**: Can be left unchecked if not needed
 4. Set **Repository permissions**:
    - **Contents**: Read (for cloning repositories)
-   - **Pull requests**: Read & Write (for reading PRs and posting comments)
+   - **Pull requests**: Read & Write (for reading PRs, posting comments, and the comment-trigger note `trigger_comments` keeps)
    - **Commit statuses**: Read & Write (for setting commit statuses)
 5. Click **Create GitHub App**
 6. Note the **App ID** shown on the next page
@@ -189,6 +189,6 @@ The GitHub App needs these permissions:
 | Permission | Access Level | Required For |
 |-----------|--------------|--------------|
 | Contents | Read | Cloning repositories, reading files |
-| Pull requests | Read & Write | Reading PR data, posting comments |
+| Pull requests | Read & Write | Reading PR data, posting comments, the `trigger_comments` note |
 | Commit statuses | Read & Write | Setting commit status (e.g., pending, success) |
 | Metadata | Read | Basic repository metadata (automatic) |

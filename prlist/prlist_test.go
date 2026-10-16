@@ -2,6 +2,7 @@ package prlist
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
@@ -875,43 +876,119 @@ func TestApplyCommentTriggers_RealPRNeverTogglesWatermarkOwnership(t *testing.T)
 	}
 }
 
-// TestApplyCommentTriggers_NonSentinelVersion_TreatsAsNoBaseline covers the
-// one-time migration case: right after upgrading from a version of this
-// resource that predates the comment-trigger bookkeeping version,
-// request.Version is still some real PR's own version, not the sentinel.
-// Since watermarks are only ever read from the sentinel, no PR has an
-// established baseline yet — not even the PR request.Version happens to
-// be about — until the bookkeeping version this check appends establishes
-// one for the future.
-func TestApplyCommentTriggers_NonSentinelVersion_TreatsAsNoBaseline(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `[{"id": 555, "body": "concourse plan"}]`)
-	})
-	gc := newTestGithubClient(t, mux)
-
-	pr := &models.PullRequest{Number: 42, HeadRefOID: "abc123", CommittedDate: "2026-01-01T00:00:00Z"}
-	prevVersion := &models.Version{PR: "42", Commit: "abc000", CommentID: 900, CommentBaseline: true}
-	request := CheckRequest{
-		Source:  Source{CommonConfig: gc.Config},
-		Version: prevVersion,
+// noteComment is this resource's comment-trigger note recording handled,
+// as the GitHub App posts it, in the JSON GitHub's comments API returns.
+func noteComment(t *testing.T, gc *models.GithubClient, pr int, head string, id, handled int64) string {
+	t.Helper()
+	marker, err := models.NoteMarker(gc.Config, gc.GithubConfig, pr, models.Version{PR: strconv.Itoa(pr), Commit: head, CommittedDate: "2026-01-01T00:00:00Z", CommentID: handled, CommentBaseline: true})
+	if err != nil {
+		t.Fatal(err)
 	}
+	body, _ := json.Marshal("### 🚀 Concourse comment triggers\n\n<!-- git-pr:comment-triggers -->\n" + marker)
+	return fmt.Sprintf(`{"id": %d, "body": %s, "user": {"login": "concourse-ci[bot]", "type": "Bot"}, "performed_via_github_app": {"id": 1}}`, id, body)
+}
 
+// TestApplyCommentTriggers_TableLost_UsesTheNote covers the check getting a
+// real PR's version (no bookkeeping table) — always the case right after a
+// comment triggers, and the live failure on a real multi-PR pipeline,
+// whose comment was recorded as a baseline and never built. The PR's
+// comment-trigger note decides instead: with no note (or one before the
+// comment) nothing has handled it, so it fires; a note at it means a build
+// already picked it up, and the same version is returned again, keeping
+// its place (Concourse already has it, so nothing builds; see
+// TestCheck_HandledCommentVersionStaysInTheSnapshot). Either way the
+// output is the same version.
+func TestApplyCommentTriggers_TableLost_UsesTheNote(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		handled   int64 // 0: no note
+		wantFired bool
+	}{
+		{"no note: fires", 0, true},
+		{"note before the comment: fires", 554, true},
+		{"note at the comment: the same, handled version", 555, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			gc := newTestGithubClient(t, mux)
+			gc.Config.GithubAppID, gc.Config.GithubAppInstallationID, gc.Config.GithubAppPrivateKey = "1", "2", "test-key"
+			mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+				comments := []string{`{"id": 555, "body": "concourse plan", "created_at": "2026-01-02T00:00:00Z"}`}
+				if tt.handled != 0 {
+					comments = append(comments, noteComment(t, gc, 42, "abc123", 600, tt.handled))
+				}
+				_, _ = fmt.Fprintf(w, "[%s]", strings.Join(comments, ","))
+			})
+
+			pr := &models.PullRequest{Number: 42, HeadRefOID: "abc123", CommittedDate: "2026-01-01T00:00:00Z"}
+			request := CheckRequest{
+				Source:  Source{CommonConfig: gc.Config},
+				Version: &models.Version{PR: "7", Commit: "abc000", CommentID: 900, CommentBaseline: true},
+			}
+			versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var fired bool
+			for _, v := range versions {
+				if v.PR == "42" && v.CommentID == 555 && v.Commit == "abc123" {
+					fired = true
+				}
+			}
+			if fired != tt.wantFired {
+				t.Fatalf("fired = %v, want %v: %+v", fired, tt.wantFired, versions)
+			}
+		})
+	}
+}
+
+// Without the table or a note, a trigger comment older than the PR's head
+// commit has been superseded by that push: it's a baseline, not a trigger,
+// so a deleted or never-written note doesn't re-run old comments.
+func TestApplyCommentTriggers_TableLost_NoNote_OldCommentDoesNotFire(t *testing.T) {
+	mux := http.NewServeMux()
+	gc := newTestGithubClient(t, mux)
+	gc.Config.GithubAppID, gc.Config.GithubAppInstallationID, gc.Config.GithubAppPrivateKey = "1", "2", "test-key"
+	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 555, "body": "concourse plan", "created_at": "2025-12-31T00:00:00Z"}]`)
+	})
+	pr := &models.PullRequest{Number: 42, HeadRefOID: "abc123", CommittedDate: "2026-01-01T00:00:00Z"}
+	request := CheckRequest{Source: Source{CommonConfig: gc.Config}, Version: &models.Version{PR: "7", Commit: "x"}}
 	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
 	for _, v := range versions {
 		if v.PR == "42" {
-			t.Fatalf("PR #42 triggered even though request.Version wasn't the bookkeeping version: %+v", versions)
+			t.Fatalf("an old comment fired: %+v", versions)
 		}
 	}
-	if len(versions) != 1 || versions[0].PR != sentinelPR {
-		t.Fatalf("expected exactly the bookkeeping version, got %+v", versions)
+}
+
+// A note that isn't this resource's own — another resource's key, posted
+// by another App, or by someone else — never counts as handled.
+func TestApplyCommentTriggers_IgnoresNotesThatArentOurs(t *testing.T) {
+	mux := http.NewServeMux()
+	gc := newTestGithubClient(t, mux)
+	gc.Config.GithubAppID, gc.Config.GithubAppInstallationID, gc.Config.GithubAppPrivateKey = "1", "2", "test-key"
+	mux.HandleFunc("/repos/owner/repo/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"id": 555, "body": "concourse plan", "created_at": "2026-01-02T00:00:00Z"},
+			{"id": 600, "body": "<!-- git-pr:comment-triggers --> <!-- git-pr:comment-trigger:someone-elses:handled=999:sig=00000000000000000000000000000000 -->", "user": {"type": "Bot"}, "performed_via_github_app": {"id": 1}},
+			{"id": 602, "body": "<!-- git-pr:comment-triggers --> <!-- git-pr:comment-trigger:%[1]s:handled=999:sig=00000000000000000000000000000000 -->", "user": {"type": "Bot"}, "performed_via_github_app": {"id": 1}},
+			{"id": 601, "body": "<!-- git-pr:comment-triggers --> <!-- git-pr:comment-trigger:%[1]s:handled=999:sig=00000000000000000000000000000000 -->", "user": {"login": "mallory", "type": "User"}}]`, models.NoteKey(gc.Config, gc.GithubConfig))
+	})
+	pr := &models.PullRequest{Number: 42, HeadRefOID: "abc123", CommittedDate: "2026-01-01T00:00:00Z"}
+	request := CheckRequest{Source: Source{CommonConfig: gc.Config}, Version: &models.Version{PR: "7", Commit: "x"}}
+	versions, err := applyCommentTriggers(context.Background(), request, gc, []*models.PullRequest{pr}, nil, DefaultCheckConcurrency)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if versions[0].CommentWatermarks["42"] != 555 {
-		t.Errorf("bookkeeping CommentWatermarks[\"42\"] = %d, want 555 (establishing baseline)", versions[0].CommentWatermarks["42"])
+	for _, v := range versions {
+		if v.PR == "42" && v.CommentID == 555 {
+			return
+		}
 	}
+	t.Fatalf("comment 555 should fire, the notes aren't ours: %+v", versions)
 }
 
 // TestApplyCommentTriggers_ClosingOnePRNeverPerturbsAnother is a regression
@@ -1478,85 +1555,76 @@ func TestCheck_CommentTrigger_FiresEvenWhenLatestPushDoesNotMatchPaths(t *testin
 	}
 }
 
-// TestCheck_CommentTrigger_NonSentinelLastVersion_ReEstablishesBaseline
-// covers the migration/steady-state edge case: request.Version is some
-// real PR's own version (here, PR #20's), not the bookkeeping version.
-// This can happen right after upgrading from a version of this resource
-// that predates the bookkeeping version, on the very first-ever check,
-// or simply because a real PR's commit legitimately sorted after the
-// bookkeeping version in some earlier check (the sentinel is prepended,
-// not appended — see applyCommentTriggers' doc comment — specifically so
-// a real commit is always free to end up "latest" instead of it). Either
-// way, whenever the bookkeeping version ISN'T what Concourse remembers as
-// latest, no PR's baseline is recoverable this check, and
-// applyCommentTriggers simply re-establishes it via a fresh bookkeeping
-// version — a bounded, harmless cost, not a correctness problem.
-//
-// Since watermarks are only ever read from the bookkeeping version,
-// request.Version being PR #20's own version instead means NO PR has a
-// recoverable baseline this check — including PR #5, even though PR #5 had
-// one established previously. Its matching comment must NOT fire a build
-// here; it only (re-)establishes PR #5's baseline on the freshly appended
-// bookkeeping version, which fires on the comment after this one.
-func TestCheck_CommentTrigger_NonSentinelLastVersion_ReEstablishesBaseline(t *testing.T) {
+// TestCheck_CommentTrigger_TableLost_FiresOnAnotherPR is PR 14 end to end:
+// another PR's version is current, and PR #5, which doesn't match paths,
+// gets a comment. It fires, at the newest comment, unless the PR's note
+// says a build already picked that one up.
+func TestCheck_CommentTrigger_TableLost_FiresOnAnotherPR(t *testing.T) {
 	const prA = 5
 	const prASHA = "aaa111"
-	const oldCommentID = 100
-	const newCommentID = 200
+	for _, tt := range []struct {
+		name      string
+		handled   int64 // 0: no note
+		wantFired bool
+	}{
+		{"no note: fires", 0, true},
+		{"older comment handled: fires", 100, true},
+		{"newest comment handled: the same, handled version", 200, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+			baseURL, err := url.Parse(server.URL + "/")
+			if err != nil {
+				t.Fatalf("failed to parse test server URL: %v", err)
+			}
+			v3.BaseURL = baseURL
+			gc := &models.GithubClient{
+				V3: v3,
+				V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
+				Config: models.CommonConfig{
+					Repository:              "owner/repo",
+					GithubAppID:             "1",
+					GithubAppInstallationID: "2",
+					GithubAppPrivateKey:     "test-key",
+					Paths:                   []string{"relevant/**"},
+					TriggerComments:         []string{"concourse plan"},
+				},
+			}
+			mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprint(w, pullRequestsGraphQLResponse(prA, prASHA))
+			})
+			mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", prA), func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprint(w, `[{"filename": "unrelated/file.txt"}]`)
+			})
+			mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", prA), func(w http.ResponseWriter, r *http.Request) {
+				comments := []string{`{"id": 100, "body": "concourse plan", "created_at": "2026-01-02T00:00:00Z"}`, `{"id": 200, "body": "concourse plan", "created_at": "2026-01-03T00:00:00Z"}`}
+				if tt.handled != 0 {
+					comments = append(comments, noteComment(t, gc, prA, prASHA, 300, tt.handled))
+				}
+				_, _ = fmt.Fprintf(w, "[%s]", strings.Join(comments, ","))
+			})
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, pullRequestsGraphQLResponse(prA, prASHA))
-	})
-	// PR #5's changed files deliberately don't match source.paths, so it's
-	// excluded from the commit-triggering set (filteredPRs) — the only way
-	// a PR #5 version could appear this check is via a genuine comment
-	// trigger firing.
-	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", prA), func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, `[{"filename": "unrelated/file.txt"}]`)
-	})
-	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", prA), func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, oldCommentID, newCommentID)
-	})
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
-	baseURL, err := url.Parse(server.URL + "/")
-	if err != nil {
-		t.Fatalf("failed to parse test server URL: %v", err)
-	}
-	v3.BaseURL = baseURL
-
-	gc := &models.GithubClient{
-		V3: v3,
-		V4: githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
-		Config: models.CommonConfig{
-			Repository:      "owner/repo",
-			Paths:           []string{"relevant/**"},
-			TriggerComments: []string{"concourse plan"},
-		},
-	}
-
-	request := CheckRequest{
-		Source: Source{CommonConfig: gc.Config},
-		Version: &models.Version{
-			PR:              "20", // a different PR is the cursor
-			Commit:          "zzz999",
-			CommentBaseline: true,
-			CommentID:       999, // PR #20's own baseline, irrelevant to PR #5
-		},
-	}
-
-	versions, err := Check(request, gc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	for _, v := range versions {
-		if v.PR == strconv.Itoa(prA) && v.CommentID == newCommentID {
-			t.Fatalf("PR #%d's comment trigger fired even though the cursor was on a different PR — no shared table should exist to make this possible: %+v", prA, versions)
-		}
+			request := CheckRequest{
+				Source:  Source{CommonConfig: gc.Config},
+				Version: &models.Version{PR: "20", Commit: "zzz999", CommentBaseline: true, CommentID: 999},
+			}
+			versions, err := Check(request, gc)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var fired bool
+			for _, v := range versions {
+				if v.PR == strconv.Itoa(prA) && v.CommentID == 200 {
+					fired = true
+				}
+			}
+			if fired != tt.wantFired {
+				t.Fatalf("fired = %v, want %v: %+v", fired, tt.wantFired, versions)
+			}
+		})
 	}
 }
 
@@ -2005,7 +2073,8 @@ func TestCheck_ManySimultaneousCommitsCommentsMergesAndNewPRs_AllFireIndependent
 	}
 	for _, pr := range commentPRs {
 		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", pr.number), func(w http.ResponseWriter, r *http.Request) {
-			_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan"}, {"id": %d, "body": "concourse plan"}]`, pr.oldCommentID, pr.newCommentID)
+			// The new comment lands in this check window, after its commits.
+			_, _ = fmt.Fprintf(w, `[{"id": %d, "body": "concourse plan", "created_at": "2026-09-02T00:00:00Z"}, {"id": %d, "body": "concourse plan", "created_at": "2026-10-07T10:00:30Z"}]`, pr.oldCommentID, pr.newCommentID)
 		})
 	}
 	for _, pr := range newPRs {

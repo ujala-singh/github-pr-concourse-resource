@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/go-github/v60/github"
 	"github.com/shurcooL/githubv4"
@@ -55,6 +56,11 @@ type CommonConfig struct {
 	// the default (see prlist.DefaultCheckConcurrency); must be between 1
 	// and 50 if set.
 	CheckConcurrency int `json:"check_concurrency"`
+	// CommentNoteKey names this resource's comment-trigger note on each PR
+	// (list mode). Unset, it's derived from the source settings (see
+	// NoteKey); set it only to tell apart two resources with identical
+	// settings.
+	CommentNoteKey string `json:"comment_note_key"`
 }
 
 // GithubConfig contains GitHub-specific configuration
@@ -68,6 +74,9 @@ type GithubConfig struct {
 func (c *CommonConfig) Validate() error {
 	if c.Repository == "" {
 		return fmt.Errorf("repository must be set")
+	}
+	if c.CommentNoteKey != "" && !noteKeyRE.MatchString(c.CommentNoteKey) {
+		return fmt.Errorf("comment_note_key %q may only contain letters, digits, '_', '.' and '-' (up to 64)", c.CommentNoteKey)
 	}
 
 	// Check authentication method
@@ -137,6 +146,15 @@ func (c *CommonConfig) Validate() error {
 }
 
 // GetOwnerAndRepo returns the owner and repository name
+// UsesGithubApp reports whether the client authenticates as the GitHub
+// App: only when the App ID, installation ID and private key are all set;
+// otherwise it uses access_token. Everything that depends on which
+// identity the resource acts as (whose comments are its own, the signing
+// key) decides with this, so they always agree with NewGithubClient.
+func (c *CommonConfig) UsesGithubApp() bool {
+	return c.GithubAppID != "" && c.GithubAppInstallationID != "" && c.GithubAppPrivateKey != ""
+}
+
 func (c *CommonConfig) GetOwnerAndRepo() (string, string) {
 	parts := strings.Split(c.Repository, "/")
 	return parts[0], parts[1]
@@ -148,6 +166,13 @@ type GithubClient struct {
 	V4           *githubv4.Client
 	Config       CommonConfig
 	GithubConfig GithubConfig
+
+	// Who the client's personal access token belongs to, resolved once
+	// (see isOwn).
+	selfOnce  sync.Once
+	selfLogin string
+	selfBot   bool
+	selfErr   error
 }
 
 // NewGithubClient creates a new GitHub client with the given configuration
@@ -165,7 +190,7 @@ func NewGithubClient(config CommonConfig, githubConfig GithubConfig) (*GithubCli
 
 	// Determine which authentication method to use
 	var ts oauth2.TokenSource
-	if config.GithubAppID != "" && config.GithubAppInstallationID != "" && config.GithubAppPrivateKey != "" {
+	if config.UsesGithubApp() {
 		// Use GitHub App authentication
 		ts = &githubAppTokenSource{
 			ctx:        ctx,
@@ -223,7 +248,7 @@ func (c *GithubClient) GetAccessToken(ctx context.Context) (string, error) {
 	}
 
 	// If using GitHub App, generate an installation token
-	if c.Config.GithubAppID != "" && c.Config.GithubAppInstallationID != "" && c.Config.GithubAppPrivateKey != "" {
+	if c.Config.UsesGithubApp() {
 		return getGithubAppToken(ctx, c.Config, nil)
 	}
 

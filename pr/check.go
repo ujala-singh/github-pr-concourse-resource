@@ -77,7 +77,12 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 		})
 	}
 
-	if len(versions) == 0 && !firstRun {
+	// With no new matching commit, return the last version so the resource
+	// keeps its place. It's returned unchanged (see the stamping below): a
+	// changed copy of it would be a new version for an old commit, and
+	// Concourse would build that commit again.
+	echoed := len(versions) == 0 && !firstRun
+	if echoed {
 		versions = []models.Version{*request.Version}
 	}
 
@@ -109,8 +114,21 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 			triggered = false
 		}
 
-		// Stamp the watermark on all versions so future checks don't re-trigger.
+		// Stamp the watermark on new commits' versions so future checks
+		// don't re-trigger. The echoed last version keeps its own, except
+		// to establish the baseline the first time: otherwise a comment
+		// after a push that doesn't match paths would re-plan its old
+		// commit, and deleting the newest comment would lower its
+		// watermark into a new version. A new comment gets its own
+		// version below.
 		for i := range versions {
+			// The commit scan also returns the last version's own commit
+			// (dated exactly at since), so it's kept as it was too.
+			if baselineEstablished && (echoed || versions[i].Commit == request.Version.Commit) {
+				versions[i].CommentID = request.Version.CommentID
+				versions[i].CommentBaseline = true
+				continue
+			}
 			versions[i].CommentID = latestMatchID
 			versions[i].CommentBaseline = true
 		}

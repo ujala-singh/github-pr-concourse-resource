@@ -52,9 +52,11 @@ func TestBuildRepoURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildRepoURL(tt.config, tt.owner, tt.repo, tt.token)
+			result := buildRepoURL(tt.config, tt.owner, tt.repo)
 			assert.Contains(t, result, tt.shouldInclude, "URL should contain expected host")
 			assert.Contains(t, result, tt.repo, "URL should contain repo name")
+			assert.NotContains(t, result, tt.token, "the token must never be in the clone URL")
+			assert.NotContains(t, result, "@", "the clone URL must carry no credentials")
 		})
 	}
 }
