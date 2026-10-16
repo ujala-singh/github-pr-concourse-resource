@@ -45,7 +45,12 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 	}
 
 	owner, repo := github.Config.GetOwnerAndRepo()
-	repoURL := buildRepoURL(github.Config, owner, repo, accessToken)
+	// The token goes to git as a header, never into the clone URL (see
+	// models.UseGitToken), so the checkout tasks see holds no credentials.
+	if err := models.UseGitToken(models.GitHost(github.Config), accessToken); err != nil {
+		return InResponse{}, fmt.Errorf("failed to configure git credentials: %w", err)
+	}
+	repoURL := buildRepoURL(github.Config, owner, repo)
 
 	baseSHA, integrationTool, err := checkoutPR(repoURL, pr.BaseRefName, prNumber, request.Version.Commit, request.Params, destinationDir)
 	if err != nil {
@@ -95,6 +100,9 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 	// Write metadata files
 	if err := writeMetadataFiles(destinationDir, metadata, request.Version); err != nil {
 		return InResponse{}, fmt.Errorf("failed to write metadata: %w", err)
+	}
+	if err := models.WriteVersionSignature(destinationDir, request.Source.CommonConfig, request.Version); err != nil {
+		return InResponse{}, err
 	}
 
 	return InResponse{
@@ -161,15 +169,8 @@ func checkoutPR(repoURL, baseRef string, prNumber int, headSHA string, params In
 	return baseSHA, integrationTool, nil
 }
 
-func buildRepoURL(config models.CommonConfig, owner, repo, token string) string {
-	if config.HostingEndpoint != "" {
-		return fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git",
-			token,
-			strings.TrimPrefix(config.HostingEndpoint, "https://"),
-			owner, repo)
-	}
-	return fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git",
-		token, owner, repo)
+func buildRepoURL(config models.CommonConfig, owner, repo string) string {
+	return fmt.Sprintf("https://%s/%s/%s.git", models.GitHost(config), owner, repo)
 }
 
 func cloneRepo(repoURL, branch, destination string, depth int, fetchTags bool) error {

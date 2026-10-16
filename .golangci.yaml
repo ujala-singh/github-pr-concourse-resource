@@ -1,0 +1,28 @@
+# golangci-lint v2 config. Run in CI by the golangci-lint GitHub Action
+# (.github/workflows/ci.yml).
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck # includes the former gosimple and stylecheck checks
+    - unused
+  exclusions:
+    # v1's default exclusions (e.g. unchecked Close() errors), kept on migration.
+    presets:
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Unchecked errors in test helpers (w.Write, json.Decode, os.MkdirAll etc.)
+      # are intentional: the test fails on bad state regardless.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt

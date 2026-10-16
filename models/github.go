@@ -351,6 +351,7 @@ func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int
 					Edges []struct {
 						Node struct {
 							DatabaseId githubv4.Int
+							Body       githubv4.String
 							Author     struct {
 								Login githubv4.String
 							}
@@ -372,9 +373,10 @@ func (gc *GithubClient) DeletePreviousComments(ctx context.Context, prNumber int
 		return fmt.Errorf("failed to query comments: %w", err)
 	}
 
-	// Delete comments made by the current user
+	// Delete comments made by the current user, except the comment-trigger
+	// note: it records which trigger comments every resource has handled.
 	for _, edge := range commentsQuery.Repository.PullRequest.Comments.Edges {
-		if string(edge.Node.Author.Login) == currentUserLogin {
+		if string(edge.Node.Author.Login) == currentUserLogin && !strings.Contains(string(edge.Node.Body), noteTag) {
 			commentID := int64(edge.Node.DatabaseId)
 			_, err := gc.V3.Issues.DeleteComment(ctx, owner, repo, commentID)
 			if err != nil {

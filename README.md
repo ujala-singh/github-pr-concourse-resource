@@ -237,6 +237,7 @@ See [docs/GITHUB_APP_AUTHENTICATION.md](docs/GITHUB_APP_AUTHENTICATION.md) for d
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `required_review_approvals` | No | `0` | Minimum number of approved reviews required |
+| `comment_note_key` | No | derived from `source` | Names this resource's marker on the [comment-trigger note](#comment-triggers). Allowed characters: letters, digits, `_`, `.`, `-`. Set it only to tell apart two list-mode resources whose `source` settings are otherwise identical. |
 
 ### Single PR Mode Configuration
 
@@ -279,6 +280,26 @@ Commenting `concourse plan` (case-insensitive, prefix match) on the PR causes th
 
   **Do not use `try:` to make that no-op build show green.** It's tempting, but `try:` masks the failure of its *entire* wrapped scope with success — wrapping a real `put` (e.g. to a `tofu`/terraform resource) in `try:` to "skip it gracefully" would also silently mask genuine plan/apply failures as green. Use `load_var` + `across` instead: have a task always succeed and write an empty list (or a single-element list) to a file based on the marker, `load_var` it, then wrap the real work in `across: { values: ((.:the_var)) }` — the real work then runs zero times (a trivial, immediate success) for the bookkeeping version, or once for a real PR, with no risk of masking a real failure. See [concourse/concourse#7521](https://github.com/concourse/concourse/discussions/7521) for why `try:` is unsafe here.
 
+  **The comment-trigger note (PR list mode).** Concourse hands `check` only the resource's *current* version, so the bookkeeping version's table is only readable while it's the current version — and right after a comment triggers, the current version is that PR's, not the bookkeeping version. To cover that gap, each PR also carries its own record *on GitHub* that every check can read. When a build's `get` picks up a trigger comment, it posts (or edits) a single comment on that PR — shared by every pipeline using the same GitHub credentials — with one row per resource:
+
+  > ### 🚀 Concourse comment triggers
+  >
+  > | Job | Picked up |
+  > |---|---|
+  > | [infra-aws / pr #9](#) | [A `concourse plan` comment](#) by **someone** |
+  > | [infra-gcp / pr #4](#) | [A `concourse plan` comment](#) by **someone** |
+  >
+  > <sub>Comment again to run them again. This comment updates in place.</sub>
+
+  Each resource's row shows the latest build whose `get` picked up a trigger, and an older comment never takes it back. Hidden in the note, each resource also keeps a **signed marker** recording the newest trigger comment it has handled. A check that still has the bookkeeping table uses the higher of the table and its marker; a check without the table uses the marker; a resource with no marker on the PR has handled nothing, so the PR's newest trigger comment fires — provided it was posted after the PR's head commit (an older one was already superseded by that push). That's what makes the *first* `concourse plan` on a PR fire even when some other PR's version is currently "latest".
+
+  Key properties:
+  - **A marker per resource, keyed by `source`** (repository, paths, filters, trigger patterns — never credentials), so one pipeline handling a comment never stops another from triggering on it. Set `comment_note_key` to tell apart two resources whose settings are otherwise identical; changing those settings starts a new marker.
+  - **Concurrency-safe.** One comment triggers every pipeline at once, so their `get`s write the note together. Each waits a short random moment, re-reads after writing, and re-checks a few seconds later, rewriting anything another job's edit dropped; duplicate notes (two created at once) are folded into the oldest. A dropped marker is harmless — the resource's next table-less check re-fires the same version Concourse already built, in the same place, so nothing rebuilds; only its row is missing until its next trigger.
+  - **Forgery-resistant.** The marker is signed with a key derived from the resource's credentials, so a task can't forge it, and only comments posted by the resource's own GitHub App (`github_app_id`) or `access_token` user are read at all. The note never copies a trigger comment's text — it names the pattern that matched and the author without mentioning them, and rows are re-rendered from stored data (markup, HTML, @-mentions and non-plain links stripped) on every write — so a hand-edit to its text is never re-posted.
+  - **`delete_previous_comments` keeps it.** `out` deletes the resource's earlier comments except the note, and the note is size-bounded (dropping the oldest entries first — rows and markers alike, never the writing resource's own) to stay under GitHub's comment limit.
+  - **`get` fails if it can't write the note**, naming the permission it needs (**Pull requests: write**) rather than silently leaving the comment looking new to every table-less check. When first rolled out, a PR that already has a trigger comment but no marker may run once.
+
 The very first `trigger_comments`-eligible check for a PR (or the first check after upgrading to a version of this resource that supports it) only establishes the watermark — it won't retroactively fire on comments that already existed before the pipeline started watching for them.
 
 **Comment triggers are independent of `paths`/`ignore_paths` matching on the latest push.** Once a PR has an established comment-trigger watermark, a matching comment fires regardless of whether the PR's most recent commit happens to touch a configured path — a comment isn't a push, and there's no reason a manual "please re-plan" request should depend on what the latest commit touched. (An earlier version of this resource got this wrong: once [path filtering was scoped to the diff since the last build](#path-filtering-and-diff-scope) instead of the PR's full history, a PR whose latest commit didn't touch a matching path could permanently stop being eligible for comment triggers too, since nothing else ever advances a stale cursor forward. Fixed — comment-trigger eligibility for the resource's tracked PR no longer depends on the commit-triggering path match.)
@@ -303,7 +324,7 @@ The very first `trigger_comments`-eligible check for a PR (or the first check af
 `paths`/`ignore_paths` are checked against the files changed **since the last build** for a PR this resource already has a previous commit recorded for — not against the PR's entire history. This matters because GitHub's "list files changed in a PR" API always returns the full base-branch-to-HEAD diff, no matter which commit you ask about: without scoping to a specific commit range, a PR that touched a matching path in *any* commit would keep matching forever, even once its latest push only changed unrelated files, causing redundant/surprising re-triggers.
 
 - **Single PR Mode**: fully correct. This mode always has a reliable previous commit (the one it last built) to diff from.
-- **PR List Mode**: correct for whichever PR currently *is* the resource's single tracked cursor (see [Comment Triggers](#comment-triggers) for the same cursor concept). For every other PR — one appearing for the first time, or one the cursor has moved away from — there's no previous commit to diff from, so the check falls back to the PR's full base...HEAD diff, same as before this existed. In practice this means: a PR you're actively pushing to gets precise, per-push path filtering once it's been checked at least once; a PR nobody's touched recently is evaluated on its full history, same as always.
+- **PR List Mode**: correct for whichever PR currently *is* the resource's single tracked cursor (see [Comment Triggers](#comment-triggers) for the same cursor concept), if it's been pushed to since it was last built. For every other PR — one appearing for the first time, an unchanged one, or one the cursor has moved away from — there's no previous commit to diff from, so the check falls back to the PR's full base...HEAD diff, same as before this existed. In practice this means: a PR you're actively pushing to gets precise, per-push path filtering once it's been checked at least once; a PR nobody's touched recently is evaluated on its full history, same as always.
 
 ### Concurrency
 
@@ -352,6 +373,8 @@ Parameters:
 | `comment_file` | No | File containing comment text |
 | `delete_previous_comments` | No | Delete this resource's earlier comments on the PR before adding a new one |
 
+`put` acts only on the exact version the preceding `get` fetched, which `get` signs (`.git/resource/version.sig`) with a key derived from the resource's credentials. A checkout whose signature is missing, doesn't verify, or was changed after the `get` fails the `put` before it reports anything, and the `pr`/`head_sha` files are ignored. `put` returns that version unchanged, so its own output never looks like a new version that would re-trigger the job. In single PR mode the version must also be for `source.number`. (The signature covers the version, its PR and commit, and the repository — not the build — since Concourse reuses a cached `get` across builds.)
+
 ## Metadata
 
 The resource provides metadata in multiple formats:
@@ -362,7 +385,7 @@ The resource provides metadata in multiple formats:
    - `title` - PR title
    - `author` - Author username
    - `head_ref` - Head branch name
-   - `head_sha` - Head commit SHA
+   - `head_sha` - The commit that was checked out — the version's commit, even if the PR has been pushed to since
    - `base_ref` - Base branch name
    - `base_sha` - Base branch tip the PR was integrated onto, captured before the PR is checked out (Single PR mode only). Diff `$(git merge-base base_sha head_sha)..head_sha` for the PR's own changes
    - `state` - PR state

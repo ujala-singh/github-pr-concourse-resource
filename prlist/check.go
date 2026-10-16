@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
@@ -40,17 +41,37 @@ func resolveCheckConcurrency(source Source) int {
 	return DefaultCheckConcurrency
 }
 
-// sortVersionsByRecency orders versions by CommittedDate ascending (RFC3339
-// timestamps sort correctly as plain strings), breaking ties by PR number
-// ascending for determinism. See Check's doc comment on why this matters:
-// Concourse assigns check_order by array position, so whichever entry ends
-// up last here is the one that wins the "current" slot — this makes that
-// the PR with the most recently pushed commit, not just whichever PR
-// happens to have the highest/newest PR number.
-func sortVersionsByRecency(versions []models.Version) {
+// sortVersionsByRecency orders versions by their latest event ascending —
+// the commit, or the PR's newest trigger comment (commentedAt, keyed by
+// PR) if that's later — breaking ties by PR number ascending for
+// determinism. See Check's doc comment on why this matters: Concourse
+// assigns check_order by array position, and version: every builds the
+// versions after the last one built, so a version must never sort before
+// one already built that's older. Ordering by commit date alone did that
+// to comment triggers: one check after a comment triggered, its PR fell
+// back behind any PR with a newer commit — including one already built —
+// before the scheduler had built it, and it never was.
+func sortVersionsByRecency(versions []models.Version, commentedAt map[string]time.Time) {
+	// latest is a version's latest event, and for a trigger comment its ID:
+	// GitHub assigns comment IDs in order across the repository, so two
+	// comments in the same second still sort in the order they were posted
+	// (a PR-number tie-break could put one that's still to be built before
+	// one already built). Commit-only events tie on 0.
+	latest := func(v models.Version) (time.Time, int64) {
+		t, _ := time.Parse(time.RFC3339, v.CommittedDate)
+		if c, ok := commentedAt[v.PR]; ok && !c.Before(t) {
+			return c, v.CommentID
+		}
+		return t, 0
+	}
 	sort.SliceStable(versions, func(i, j int) bool {
-		if versions[i].CommittedDate != versions[j].CommittedDate {
-			return versions[i].CommittedDate < versions[j].CommittedDate
+		ti, ci := latest(versions[i])
+		tj, cj := latest(versions[j])
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		if ci != cj {
+			return ci < cj
 		}
 		iNum, _ := strconv.Atoi(versions[i].PR)
 		jNum, _ := strconv.Atoi(versions[j].PR)
@@ -115,7 +136,7 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 			ApprovedReviewCount: pr.ApprovedReviewCount,
 		})
 	}
-	sortVersionsByRecency(versions)
+	sortVersionsByRecency(versions, nil)
 
 	// If nothing currently matches (e.g. no open PRs touch the configured
 	// paths), echo back the last known version so the resource doesn't
@@ -124,7 +145,10 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	// fresh one of its own when trigger_comments is set, so echoing the
 	// old one here would just add a second, stale "PR" == sentinelPR
 	// entry alongside it.
-	if len(versions) == 0 && request.Version != nil && request.Version.PR != sentinelPR {
+	// Only while that PR is still open, as the check protocol asks: a closed
+	// PR's version is no longer valid. That also rules out the bookkeeping
+	// version, which isn't a PR.
+	if len(versions) == 0 && request.Version != nil && isOpen(prs, request.Version.PR) {
 		versions = []models.Version{*request.Version}
 	}
 
@@ -137,6 +161,61 @@ func Check(request CheckRequest, github *models.GithubClient) ([]models.Version,
 	}
 
 	return versions, nil
+}
+
+// watermark is the newest comment already handled on a PR, and whether
+// that's known (only a newer comment then triggers; an unknown baseline is
+// established without triggering). It's the highest of:
+//
+//   - the bookkeeping table's entry, when this check has the table;
+//   - the PR's comment-trigger note, which a build's get writes and every
+//     check can read (see models.RecordHandledTrigger).
+//
+// When the table is lost and the PR has no note, no build has recorded
+// picking up any of its comments, so its newest trigger comment fires —
+// but only if it was posted after the PR's head commit. Without this, a
+// comment while a real PR's version was current was recorded as the
+// baseline and never built (seen live on a real multi-PR pipeline). The bound keeps
+// a missing note (deleted, or never written before this release) from
+// re-running a comment some earlier push has already superseded.
+func watermark(tracked map[string]int64, prKey string, st models.TriggerState, tableLost bool, headCommitted string) (int64, bool) {
+	sinceID, known := tracked[prKey]
+	if st.HasNote {
+		sinceID, known = max(sinceID, st.HandledID), true
+	}
+	if !known && tableLost {
+		// Strictly before: a comment in the same second as the push
+		// (both are second-precision) fires rather than being lost.
+		if committed, err := time.Parse(time.RFC3339, headCommitted); err == nil && st.LatestMatchAt.Before(committed) {
+			return st.LatestMatchID, true // superseded by a push: baseline, no trigger
+		}
+		return 0, true
+	}
+	return sinceID, known
+}
+
+// commentIsLatest reports whether the PR's newest trigger comment (id,
+// posted at) is its latest event: stamped on v and not older than v's
+// commit. A comment version is the PR,
+// its head and that comment, not its approval count: an approval alone
+// doesn't make it a new version, and nor does losing its note marker,
+// which fires the same comment again.
+func commentIsLatest(id int64, at time.Time, v models.Version) bool {
+	if id == 0 || v.CommentID != id {
+		return false
+	}
+	committed, err := time.Parse(time.RFC3339, v.CommittedDate)
+	return err != nil || !at.Before(committed)
+}
+
+// isOpen reports whether pr is the number of one of prs.
+func isOpen(prs []*models.PullRequest, pr string) bool {
+	for _, p := range prs {
+		if strconv.Itoa(p.Number) == pr {
+			return true
+		}
+	}
+	return false
 }
 
 // runBounded runs fn(i) for i in [0, n) with at most concurrency goroutines
@@ -182,8 +261,12 @@ func filterPRsByPath(ctx context.Context, github *models.GithubClient, prs []*mo
 
 	runBounded(len(prs), concurrency, func(i int) {
 		pr := prs[i]
+		// Diff from the last known version's commit only if the PR has
+		// been pushed to since: diffing the head against itself finds no
+		// files and would drop the PR, so an unchanged PR uses its full
+		// diff instead.
 		var sinceSHA string
-		if lastVersion != nil && lastVersion.PR == strconv.Itoa(pr.Number) {
+		if lastVersion != nil && lastVersion.PR == strconv.Itoa(pr.Number) && lastVersion.Commit != pr.HeadRefOID {
 			sinceSHA = lastVersion.Commit
 		}
 		m, err := github.MatchesPathFilters(ctx, pr, sinceSHA)
@@ -288,8 +371,14 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	type result struct {
 		pr            *models.PullRequest
 		latestMatchID int64
+		latestMatchAt time.Time
 		triggered     bool
-		err           error
+		// handled: the exact version a build fetched for this PR's newest
+		// trigger comment, while its head hasn't moved. It keeps being
+		// returned, so it keeps its place in the order (see the append
+		// loop).
+		handled *models.Version
+		err     error
 	}
 	results := make([]result, len(allPRs))
 
@@ -299,20 +388,33 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 	// version-mutation pass below stays sequential over allPRs' original
 	// order, so the output is deterministic regardless of which goroutine
 	// finishes first.
+	// The table is unrecoverable when Concourse hands this check a real
+	// PR's version (which never carries it) rather than the bookkeeping
+	// version — always the case right after a comment triggers.
+	tableLost := request.Version != nil && tracked == nil
+
 	runBounded(len(allPRs), concurrency, func(i int) {
 		pr := allPRs[i]
 		prKey := strconv.Itoa(pr.Number)
-		sinceID, baselineEstablished := tracked[prKey]
 
-		latestMatchID, triggered, err := github.CheckTriggerComments(ctx, pr.Number, request.Source.TriggerComments, sinceID)
+		st, err := github.TriggerState(ctx, pr.Number, request.Source.TriggerComments)
 		if err != nil {
 			results[i] = result{err: fmt.Errorf("failed to check trigger comments for PR #%d: %w", pr.Number, err)}
 			return
 		}
-		if !baselineEstablished {
-			triggered = false
+		sinceID, baselineEstablished := watermark(tracked, prKey, st, tableLost, pr.CommittedDate)
+		triggered := baselineEstablished && st.LatestMatchID > sinceID
+		// The exact version a build fetched for the PR's newest trigger
+		// comment, kept only while the PR's head is still its commit: a
+		// push needs a matching change or a fresh comment of its own, and
+		// nothing else about the PR (an approval, a commit date) makes it
+		// a new version.
+		var handled *models.Version
+		if v := st.HandledVersion; v != nil && st.LatestMatchID != 0 && st.HandledID == st.LatestMatchID &&
+			v.PR == prKey && v.CommentID == st.LatestMatchID && v.Commit == pr.HeadRefOID {
+			handled = v
 		}
-		results[i] = result{pr: pr, latestMatchID: latestMatchID, triggered: triggered}
+		results[i] = result{pr: pr, latestMatchID: st.LatestMatchID, latestMatchAt: st.LatestMatchAt, triggered: triggered, handled: handled}
 	})
 
 	for _, r := range results {
@@ -355,10 +457,26 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			versions[j].CommittedDate = r.pr.CommittedDate
 			versions[j].ApprovedReviewCount = r.pr.ApprovedReviewCount
 		}
+		// While its trigger comment is the PR's latest event, its version
+		// is the comment version, whether or not the PR matches paths this
+		// check (which, for the current version's PR, depends on whether
+		// it's diffed from its last commit or in full): the same shape the
+		// append loop below gives it, so the two can't make two versions
+		// of one trigger.
+		if commentIsLatest(r.latestMatchID, r.latestMatchAt, versions[j]) {
+			versions[j].ApprovedReviewCount = 0
+		}
 	}
 
+	// A PR not otherwise returned (it doesn't match paths) gets its comment
+	// version when the comment triggers, and keeps getting the same one
+	// once a build has handled it, while the comment is still its latest
+	// event. Dropping it from the output then would leave the other PRs'
+	// versions, re-ranked by this check, ahead of it, and a version: every
+	// job that hasn't built it yet would skip it. A comment only recorded
+	// as a baseline (no build picked it up) never makes a version.
 	for _, r := range results {
-		if !r.triggered {
+		if !r.triggered && r.handled == nil {
 			continue
 		}
 		prKey := strconv.Itoa(r.pr.Number)
@@ -366,36 +484,46 @@ func applyCommentTriggers(ctx context.Context, request CheckRequest, github *mod
 			// Already stamped in place above — don't duplicate the entry.
 			continue
 		}
-		versions = append(versions, models.Version{
+		if !r.triggered {
+			versions = append(versions, *r.handled) // exactly as it was built
+			continue
+		}
+		// The same shape the in-place branch above gives a PR that matches
+		// paths, so whichever branch a PR goes through (and, for the current
+		// version's PR, that depends on how it's diffed), one trigger is one
+		// version: the comment version (no approval count) while the comment
+		// is the PR's latest event, else with its approval count. An
+		// approval alone, or the comment firing again after its marker was
+		// lost, then can't make a new version.
+		v := models.Version{
 			PR:                  prKey,
 			Commit:              r.pr.HeadRefOID,
 			CommittedDate:       r.pr.CommittedDate,
 			ApprovedReviewCount: r.pr.ApprovedReviewCount,
 			CommentID:           r.latestMatchID,
 			CommentBaseline:     true,
-		})
+		}
+		if commentIsLatest(r.latestMatchID, r.latestMatchAt, v) {
+			v.ApprovedReviewCount = 0
+		}
+		versions = append(versions, v)
 	}
 
-	// Move any PR that genuinely triggered this cycle after every PR that
-	// didn't, preserving each group's relative order. A comment trigger
-	// doesn't bump CommittedDate — the underlying commit didn't change —
-	// so Check's recency sort (sortVersionsByRecency) wouldn't otherwise
-	// place a triggered PR last, and Concourse decides what's "current"
-	// purely by final array position (see that function's doc comment).
-	// A freshly appended triggered PR (the loop just above) is already at
-	// the tail, so this is a no-op for it; this only actually moves a
-	// triggered PR that was already present at some earlier, date-sorted
-	// position.
-	stable := make([]models.Version, 0, len(versions))
-	var triggeredEntries []models.Version
-	for _, v := range versions {
-		if r, ok := byPR[v.PR]; ok && r.triggered {
-			triggeredEntries = append(triggeredEntries, v)
-			continue
+	// Order everything by its latest event, comments included (see
+	// sortVersionsByRecency). A PR that triggered this check isn't moved
+	// last on top of that: it would sit last only until the trigger is
+	// recorded, then fall back to its event-time position next check,
+	// and that reshuffle can put a version still waiting to build behind
+	// one already built, so version: every never builds it. A fresh
+	// comment is its PR's newest event, so it lands last anyway, the same
+	// way on every check.
+	commentedAt := make(map[string]time.Time, len(byPR))
+	for k, r := range byPR {
+		if r.latestMatchID != 0 {
+			commentedAt[k] = r.latestMatchAt
 		}
-		stable = append(stable, v)
 	}
-	versions = append(stable, triggeredEntries...)
+	sortVersionsByRecency(versions, commentedAt)
 
 	// newTable (this cycle's complete, freshly pruned-to-currently-open-PRs
 	// table) only needs to be recorded somewhere when it actually changed.

@@ -478,12 +478,25 @@ func TestOut_PropagatesCommentWatermarkFromVersionJSON(t *testing.T) {
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, singlePRGraphQLResponse(prNumber, headSHA))
 	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/commits", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"sha": %q}]`, headSHA)
+	})
+	mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/issues/%d/comments", prNumber), func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `[{"id": 9999, "body": "concourse plan"}]`)
+	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+	v3URL, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3.BaseURL = v3URL
 	gc := &models.GithubClient{
+		V3:     v3,
 		V4:     githubv4.NewEnterpriseClient(server.URL+"/graphql", nil),
-		Config: models.CommonConfig{Repository: "owner/repo"},
+		Config: models.CommonConfig{Repository: "owner/repo", AccessToken: "test-token"},
 	}
 
 	sourcesDir := t.TempDir()
@@ -506,6 +519,9 @@ func TestOut_PropagatesCommentWatermarkFromVersionJSON(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(resourceDir, "version.json"), versionJSON, 0644); err != nil {
 		t.Fatalf("failed to write version.json: %v", err)
+	}
+	if err := models.WriteVersionSignature(filepath.Join(sourcesDir, "pull-request"), gc.Config, triggeringVersion); err != nil {
+		t.Fatal(err)
 	}
 
 	request := OutRequest{

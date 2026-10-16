@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"github.com/ujala-singh/github-pr-concourse-resource/models"
 )
@@ -43,6 +42,12 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 		if err := writeMetadataFiles(destinationDir, metadata, request.Version); err != nil {
 			return InResponse{}, fmt.Errorf("failed to write metadata: %w", err)
 		}
+		if err := models.WriteVersionSignature(destinationDir, request.Source.CommonConfig, request.Version); err != nil {
+			return InResponse{}, err
+		}
+		if err := recordTrigger(ctx, request, github, prNumber); err != nil {
+			return InResponse{}, err
+		}
 
 		return InResponse{
 			Version:  request.Version,
@@ -68,7 +73,12 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 
 	// Clone the base branch
 	owner, repo := github.Config.GetOwnerAndRepo()
-	repoURL := buildRepoURL(github.Config, owner, repo, accessToken)
+	// The token goes to git as a header, never into the clone URL (see
+	// models.UseGitToken), so the checkout tasks see holds no credentials.
+	if err := models.UseGitToken(models.GitHost(github.Config), accessToken); err != nil {
+		return InResponse{}, fmt.Errorf("failed to configure git credentials: %w", err)
+	}
+	repoURL := buildRepoURL(github.Config, owner, repo)
 
 	if err := cloneRepo(repoURL, pr.BaseRefName, destinationDir, request.Params.GitDepth); err != nil {
 		return InResponse{}, fmt.Errorf("failed to clone repository: %w", err)
@@ -92,7 +102,10 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 		{Name: "author", Value: pr.AuthorLogin},
 		{Name: "author_avatar", Value: pr.AuthorAvatarURL},
 		{Name: "head_ref", Value: pr.HeadRefName},
-		{Name: "head_sha", Value: pr.HeadRefOID},
+		// The commit checked out, not the PR's head now: a push since
+		// the check would otherwise have statuses and links point at a
+		// commit this build never saw.
+		{Name: "head_sha", Value: request.Version.Commit},
 		{Name: "base_ref", Value: pr.BaseRefName},
 		{Name: "state", Value: pr.State},
 		{Name: "draft", Value: strconv.FormatBool(pr.IsDraft)},
@@ -114,11 +127,34 @@ func In(request InRequest, github *models.GithubClient, destinationDir string) (
 	if err := writeMetadataFiles(destinationDir, metadata, request.Version); err != nil {
 		return InResponse{}, fmt.Errorf("failed to write metadata: %w", err)
 	}
+	if err := models.WriteVersionSignature(destinationDir, request.Source.CommonConfig, request.Version); err != nil {
+		return InResponse{}, err
+	}
+	if err := recordTrigger(ctx, request, github, prNumber); err != nil {
+		return InResponse{}, err
+	}
 
 	return InResponse{
 		Version:  request.Version,
 		Metadata: metadata,
 	}, nil
+}
+
+// recordTrigger records on the PR's comment-trigger note that this build
+// picked up the trigger comments up to the version's comment_id, so later
+// checks don't trigger on them again even when they can't read the
+// bookkeeping version (see applyCommentTriggers). It fails the get rather
+// than carry on: until it's recorded, a check without the table would keep
+// treating the comment as new.
+func recordTrigger(ctx context.Context, request InRequest, github *models.GithubClient, prNumber int) error {
+	if len(request.Source.TriggerComments) == 0 || request.Version.CommentID == 0 {
+		return nil
+	}
+	build := models.BuildLinkFromEnv(request.Source.ConcourseURL)
+	if err := github.RecordHandledTrigger(ctx, prNumber, request.Source.TriggerComments, request.Version, build); err != nil {
+		return fmt.Errorf("failed to record comment trigger on PR #%d (the GitHub App needs Pull requests: write): %w", prNumber, err)
+	}
+	return nil
 }
 
 // BookkeepingMarkerFile is written at the root of the destination directory
@@ -199,15 +235,8 @@ func writeMetadataFiles(destDir string, metadata []models.Metadata, version mode
 
 // Git helper functions
 
-func buildRepoURL(config models.CommonConfig, owner, repo, token string) string {
-	if config.HostingEndpoint != "" {
-		return fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git",
-			token,
-			strings.TrimPrefix(config.HostingEndpoint, "https://"),
-			owner, repo)
-	}
-	return fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git",
-		token, owner, repo)
+func buildRepoURL(config models.CommonConfig, owner, repo string) string {
+	return fmt.Sprintf("https://%s/%s/%s.git", models.GitHost(config), owner, repo)
 }
 
 func cloneRepo(repoURL, branch, destination string, depth int) error {
