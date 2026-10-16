@@ -839,3 +839,74 @@ func TestCheck_TriggerVersionKeepsApprovalsWhenAPushFollowsTheComment(t *testing
 		t.Fatalf("A's version = %+v, want comment 100's version at a-new with its approval count", first)
 	}
 }
+
+// TestCheck_NoteHandledComment_SameSecondCommitStaysReachable is the Check-
+// level regression for the originally observed bug, exercised through a
+// realistic already-built comment: PR 1 has a trigger comment (id 100) that a
+// prior build handled (recorded in its signed note), so it is PR 1's latest
+// event; PR 2 gets a brand-new commit in that same second. The fixed same-
+// second order puts the comment before the commit, so the new commit lands
+// after the built comment and a version: every job still reaches it. PR 2 must
+// sort after PR 1.
+func TestCheck_NoteHandledComment_SameSecondCommitStaysReachable(t *testing.T) {
+	const sameSecond = "2026-10-07T10:00:00Z"
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		// PR 1: old head, so its handled comment at sameSecond is its latest event.
+		a := `{"node":{"number": 1, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+			"baseRefName": "main", "headRefName": "f", "headRefOid": "sha1-old",
+			"repository": {"url": "u"}, "headRepository": {"url": "u"}, "author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+			"commits": {"nodes": [{"commit": {"oid": "sha1-old", "committedDate": "2026-10-06T00:00:00Z", "additions": 1, "deletions": 0}}]},
+			"reviews": {"nodes": []}}}`
+		// PR 2: a brand-new commit in the SAME second as PR 1's handled comment.
+		b := fmt.Sprintf(`{"node":{"number": 2, "title": "t", "url": "u", "state": "OPEN", "isDraft": false,
+			"baseRefName": "main", "headRefName": "f", "headRefOid": "sha2-new",
+			"repository": {"url": "u"}, "headRepository": {"url": "u"}, "author": {"login": "a", "avatarUrl": ""}, "labels": {"nodes": []},
+			"commits": {"nodes": [{"commit": {"oid": "sha2-new", "committedDate": %q, "additions": 1, "deletions": 0}}]},
+			"reviews": {"nodes": []}}}`, sameSecond)
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"pullRequests":{"edges":[%s,%s],"pageInfo":{"endCursor":"","hasNextPage":false}}}}}`, a, b)
+	})
+	for n := 1; n <= 2; n++ {
+		mux.HandleFunc(fmt.Sprintf("/repos/owner/repo/pulls/%d/files", n), func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `[{"filename": "terraform/main.tf"}]`)
+		})
+	}
+	gc := &models.GithubClient{
+		Config: models.CommonConfig{Repository: "owner/repo", Paths: []string{"terraform/**"}, TriggerComments: []string{"concourse plan"},
+			GithubAppID: "1", GithubAppInstallationID: "2", GithubAppPrivateKey: "test-key"},
+	}
+	// PR 1's note: comment 100 handled at PR 1's current head.
+	marker, err := models.NoteMarker(gc.Config, gc.GithubConfig, 1, models.Version{PR: "1", Commit: "sha1-old", CommittedDate: "2026-10-06T00:00:00Z", CommentID: 100, CommentBaseline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, _ := json.Marshal("### 🚀 Concourse comment triggers\n\n<!-- git-pr:comment-triggers -->\n" + marker)
+	mux.HandleFunc("/repos/owner/repo/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `[{"id": 100, "body": "concourse plan", "created_at": %q},
+			{"id": 150, "body": %s, "user": {"type": "Bot"}, "performed_via_github_app": {"id": 1}}]`, sameSecond, note)
+	})
+	mux.HandleFunc("/repos/owner/repo/issues/2/comments", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, `[]`) })
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	v3 := github.NewClient(&http.Client{Transport: &http.Transport{}})
+	baseURL, _ := url.Parse(server.URL + "/")
+	v3.BaseURL = baseURL
+	gc.V3, gc.V4 = v3, githubv4.NewEnterpriseClient(server.URL+"/graphql", nil)
+
+	// Current version is a real PR (PR 1's handled comment), so the bookkeeping
+	// table is nil — only the note carries PR 1's handled state.
+	last := models.Version{PR: "1", Commit: "sha1-old", CommittedDate: "2026-10-06T00:00:00Z", CommentID: 100, CommentBaseline: true}
+	versions, err := Check(CheckRequest{Source: Source{CommonConfig: gc.Config}, Version: &last}, gc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, v := range versions {
+		if v.PR != sentinelPR {
+			order = append(order, v.PR)
+		}
+	}
+	if !reflect.DeepEqual(order, []string{"1", "2"}) {
+		t.Fatalf("new same-second commit on PR 2 must sort after PR 1's note-handled comment, so version: every reaches it; got order %v (full: %+v)", order, versions)
+	}
+}

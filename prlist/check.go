@@ -43,20 +43,33 @@ func resolveCheckConcurrency(source Source) int {
 
 // sortVersionsByRecency orders versions by their latest event ascending —
 // the commit, or the PR's newest trigger comment (commentedAt, keyed by
-// PR) if that's later — breaking ties by PR number ascending for
-// determinism. See Check's doc comment on why this matters: Concourse
-// assigns check_order by array position, and version: every builds the
-// versions after the last one built, so a version must never sort before
-// one already built that's older. Ordering by commit date alone did that
-// to comment triggers: one check after a comment triggered, its PR fell
-// back behind any PR with a newer commit — including one already built —
-// before the scheduler had built it, and it never was.
+// PR) if that's later — breaking ties by comment ID, then PR number, for a
+// deterministic and stable order. See Check's doc comment on why this matters:
+// Concourse assigns check_order by array position, and version: every builds
+// the versions after the last one built, so a newly discovered version must
+// never sort before one already built. Ordering by commit date alone did that
+// to comment triggers: one check after a comment triggered, its PR fell back
+// behind any PR with a newer commit — including one already built — before the
+// scheduler had built it, and it never was.
+//
+// Same-second ties use one fixed, handled-independent rule so the order is a
+// valid strict weak ordering (transitive) and never changes as comments get
+// built: at an equal timestamp a comment (tie value its ID) sorts before a
+// commit (tie value 0), comments among themselves by ID, commits among
+// themselves by PR number. Deciding the one irreducible tie — a commit and a
+// comment in the same second — by a constant rule rather than by either side's
+// handled state is what keeps it stable: feeding one check's result into the
+// next never reshuffles it, so a version waiting to build is never moved behind
+// one already built. Putting the comment first keeps an already-built comment
+// ahead of a same-second new commit (the observed failure this fixes). The
+// mirror — a brand-new comment sharing the exact second as an already-built
+// commit on a different PR — is left in its event-time position; that needs a
+// per-event built-state we don't persist, and is a far rarer coincidence.
 func sortVersionsByRecency(versions []models.Version, commentedAt map[string]time.Time) {
 	// latest is a version's latest event, and for a trigger comment its ID:
 	// GitHub assigns comment IDs in order across the repository, so two
-	// comments in the same second still sort in the order they were posted
-	// (a PR-number tie-break could put one that's still to be built before
-	// one already built). Commit-only events tie on 0.
+	// comments in the same second still sort in the order they were posted.
+	// Commit-only events tie on 0.
 	latest := func(v models.Version) (time.Time, int64) {
 		t, _ := time.Parse(time.RFC3339, v.CommittedDate)
 		if c, ok := commentedAt[v.PR]; ok && !c.Before(t) {
@@ -69,6 +82,11 @@ func sortVersionsByRecency(versions []models.Version, commentedAt map[string]tim
 		tj, cj := latest(versions[j])
 		if !ti.Equal(tj) {
 			return ti.Before(tj)
+		}
+		// Same second: a comment (tie > 0) before a commit (tie 0), a fixed
+		// order that never flips as comments get built.
+		if (ci == 0) != (cj == 0) {
+			return ci != 0 // the comment (non-zero tie) sorts first
 		}
 		if ci != cj {
 			return ci < cj

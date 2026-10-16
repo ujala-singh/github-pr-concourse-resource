@@ -2225,3 +2225,120 @@ func TestCheck_ManySimultaneousCommitsCommentsMergesAndNewPRs_AllFireIndependent
 		t.Errorf("bookkeeping CommentWatermarks = %v, want %v (PRs #9/#10 must drop out)", sentinel.CommentWatermarks, wantTable)
 	}
 }
+
+// TestSortVersionsByRecency_SameSecondCommentBeforeCommit is the regression for
+// the originally observed bug: a commit discovered in the same second as an
+// already-built trigger comment on another PR. A commit's tie value is 0, so
+// ordering ties by value alone put the new commit before the built comment
+// (0 < the comment's ID); version: every then skipped the commit. The fixed
+// rule puts the comment first, so the new commit lands after it (and gets
+// built) — the same way on every check, regardless of input order.
+func TestSortVersionsByRecency_SameSecondCommentBeforeCommit(t *testing.T) {
+	const ts = "2026-10-16T13:00:00Z"
+	tsTime, _ := time.Parse(time.RFC3339, ts)
+
+	// PR 1: a trigger comment at ts. PR 2: a commit in the same second.
+	comment := models.Version{PR: "1", Commit: "c1", CommittedDate: "2026-10-16T12:00:00Z", CommentID: 500, CommentBaseline: true}
+	commit := models.Version{PR: "2", Commit: "c2-new", CommittedDate: ts}
+
+	commentedAt := map[string]time.Time{"1": tsTime}
+
+	order := func(in ...models.Version) []string {
+		v := append([]models.Version(nil), in...)
+		sortVersionsByRecency(v, commentedAt)
+		return []string{v[0].PR, v[1].PR}
+	}
+	want := []string{"1", "2"}
+	if got := order(comment, commit); !reflect.DeepEqual(got, want) {
+		t.Fatalf("same-second comment must sort before the commit; got %v", got)
+	}
+	if got := order(commit, comment); !reflect.DeepEqual(got, want) {
+		t.Fatalf("order must not depend on input/cursor; got %v", got)
+	}
+}
+
+// TestSortVersionsByRecency_SameSecondOrderInvariantToHandling is the
+// before/after-handling regression. The earlier design keyed the commit-vs-
+// comment tie on the comment's handled watermark, so the pair flipped from
+// [commit, comment] to [comment, commit] the moment the comment was built —
+// a second job sitting at the commit could then have the comment move behind
+// its cursor and skip it. The fixed order ignores handled state entirely, so
+// the same inputs sort the same way before and after the comment is built.
+func TestSortVersionsByRecency_SameSecondOrderInvariantToHandling(t *testing.T) {
+	const ts = "2026-10-16T13:00:00Z"
+	tsTime, _ := time.Parse(time.RFC3339, ts)
+
+	comment := models.Version{PR: "1", Commit: "c1", CommittedDate: "2026-10-16T12:00:00Z", CommentID: 700, CommentBaseline: true}
+	commit := models.Version{PR: "2", Commit: "c2", CommittedDate: ts}
+	commentedAt := map[string]time.Time{"1": tsTime}
+
+	// "Before handling" and "after handling" are the same call: handled state
+	// is no longer an input, so it cannot reorder anything.
+	before := []models.Version{comment, commit}
+	sortVersionsByRecency(before, commentedAt)
+	after := []models.Version{comment, commit}
+	sortVersionsByRecency(after, commentedAt)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("handling a comment reordered the same inputs: before %+v, after %+v", before, after)
+	}
+}
+
+// TestSortVersionsByRecency_SameSecondThreeEventsTransitive guards the strict
+// weak ordering contract sort.SliceStable requires. Three events in the same
+// second across different PRs — two comments (IDs 100, 200) and a commit — must
+// yield one deterministic total order from every input permutation. The earlier
+// handled-keyed rule was non-transitive here (unbuilt 100 < built 200 by ID,
+// built 200 < commit, commit < unbuilt 100), a cycle that left the sort output
+// undefined.
+func TestSortVersionsByRecency_SameSecondThreeEventsTransitive(t *testing.T) {
+	const ts = "2026-10-16T13:00:00Z"
+	tsTime, _ := time.Parse(time.RFC3339, ts)
+
+	c100 := models.Version{PR: "1", Commit: "c1", CommittedDate: "2026-10-16T12:00:00Z", CommentID: 100, CommentBaseline: true}
+	c200 := models.Version{PR: "2", Commit: "c2", CommittedDate: "2026-10-16T12:00:00Z", CommentID: 200, CommentBaseline: true}
+	commit := models.Version{PR: "3", Commit: "c3", CommittedDate: ts}
+	commentedAt := map[string]time.Time{"1": tsTime, "2": tsTime}
+
+	// Comments (by ID) before the commit, on every permutation of the input.
+	want := []string{"1", "2", "3"}
+	perms := [][]models.Version{
+		{c100, c200, commit}, {c100, commit, c200}, {c200, c100, commit},
+		{c200, commit, c100}, {commit, c100, c200}, {commit, c200, c100},
+	}
+	for _, in := range perms {
+		v := append([]models.Version(nil), in...)
+		sortVersionsByRecency(v, commentedAt)
+		got := []string{v[0].PR, v[1].PR, v[2].PR}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("non-deterministic order from permutation %v: got %v, want %v",
+				[]string{in[0].PR, in[1].PR, in[2].PR}, got, want)
+		}
+	}
+}
+
+// TestSortVersionsByRecency_SameSecondCommentsStable feeds each check's result
+// back into the next and asserts the order never flips. Two comments in the
+// same second must keep their stable comment-ID order; an earlier design that
+// put the "current" (cursor) version first oscillated between [1,2] and [2,1]
+// on every check with no new activity.
+func TestSortVersionsByRecency_SameSecondCommentsStable(t *testing.T) {
+	const ts = "2026-10-16T13:00:00Z"
+	tsTime, _ := time.Parse(time.RFC3339, ts)
+
+	a := models.Version{PR: "1", Commit: "c1", CommittedDate: "2026-10-16T12:00:00Z", CommentID: 100, CommentBaseline: true}
+	b := models.Version{PR: "2", Commit: "c2", CommittedDate: "2026-10-16T12:00:00Z", CommentID: 101, CommentBaseline: true}
+	commentedAt := map[string]time.Time{"1": tsTime, "2": tsTime}
+
+	want := []string{"1", "2"}
+	versions := []models.Version{a, b}
+	for range 5 {
+		sortVersionsByRecency(versions, commentedAt)
+		got := []string{versions[0].PR, versions[1].PR}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("same-second comment order oscillated: got %v, want %v", got, want)
+		}
+		// Feed this check's result back as the next check's input (the last
+		// element is what Concourse carries forward as the current version).
+		versions = []models.Version{versions[1], versions[0]}
+	}
+}
