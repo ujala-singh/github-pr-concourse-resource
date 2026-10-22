@@ -1,4 +1,4 @@
-FROM golang:1.27-alpine AS builder
+FROM golang:1.27.3-alpine AS builder
 
 RUN apk add --no-cache git openssh-client ca-certificates
 
@@ -15,7 +15,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /assets/check ./c
 
 FROM alpine:3.24
 
-RUN apk add --no-cache git openssh-client ca-certificates git-lfs bash
+# git: clone/merge/rebase PR checkouts; openssh-client: SSH remotes;
+# git-lfs: LFS checkouts; bash: for `fly intercept` into the container.
+# The minimum CA bundle distrusts the compromised eMudhra certificate chains.
+RUN apk add --no-cache git openssh-client 'ca-certificates>=20261020-r0' git-lfs bash
 
 COPY --from=builder /assets /opt/resource/
 
